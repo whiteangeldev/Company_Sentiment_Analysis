@@ -1,24 +1,19 @@
 import csv
 import time
-import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import json
 from pathlib import Path
-import urllib3
-
-# Suppress SSL warnings when verification is disabled
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 
 MAX_PAGES = 50  # limit per website
 TIMEOUT = 30
 MAX_RETRIES = 3  # Retry each request up to 3 times
+PAGE_LOAD_WAIT = 5  # Seconds to wait for page to fully load
 
 # Keywords to classify page type
 SECTION_KEYWORDS = {
@@ -28,6 +23,31 @@ SECTION_KEYWORDS = {
     "leadership": ["team", "leadership", "management"],
     "blog": ["blog", "news", "press"],
 }
+
+
+def init_browser():
+    """Initialize Selenium Chrome browser with headless options"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(TIMEOUT)
+        return driver
+    except Exception as e:
+        print(f"❌ Failed to initialize browser: {e}")
+        return None
 
 
 def classify_section(url_path: str):
@@ -49,27 +69,32 @@ def extract_text(html: str):
     return " ".join(text.split())
 
 
-def fetch_page(url, session):
-    """Simple, reliable page fetch with retries"""
+def fetch_page(url, driver):
+    """Fetch page using Selenium browser with retries"""
     for attempt in range(MAX_RETRIES):
         try:
-            r = session.get(
-                url,
-                headers=HEADERS,
-                timeout=TIMEOUT,
-                verify=False,  # Skip SSL issues - these are simple sites
-                allow_redirects=True
-            )
-            if r.status_code == 200:
-                return r, None
-            elif r.status_code == 403 or r.status_code == 429:
-                # Rate limited, wait longer
-                time.sleep(3 * (attempt + 1))
+            driver.get(url)
+            # Wait for page to load
+            time.sleep(PAGE_LOAD_WAIT)
+
+            # Get page source
+            html = driver.page_source
+
+            # Check if we got meaningful content
+            if html and len(html) > 500:
+                return html, None
             else:
-                time.sleep(1)
-        except requests.exceptions.Timeout:
+                if attempt == MAX_RETRIES - 1:
+                    return None, "Page loaded but content too small"
+                time.sleep(2)
+
+        except TimeoutException:
             if attempt == MAX_RETRIES - 1:
                 return None, "Timeout after retries"
+            time.sleep(2)
+        except WebDriverException as e:
+            if attempt == MAX_RETRIES - 1:
+                return None, f"WebDriver error: {str(e)[:60]}"
             time.sleep(2)
         except Exception as e:
             if attempt == MAX_RETRIES - 1:
@@ -78,14 +103,13 @@ def fetch_page(url, session):
     return None, "Max retries reached"
 
 
-def scrape_site(company_id, company_name, base_url):
+def scrape_site(company_id, company_name, base_url, driver):
     visited = set()
     queue = [base_url]
     scraped_pages = []
     errors = []
 
     domain = urlparse(base_url).netloc
-    session = requests.Session()
 
     while queue and len(visited) < MAX_PAGES:
         url = queue.pop(0)
@@ -93,41 +117,40 @@ def scrape_site(company_id, company_name, base_url):
             continue
         visited.add(url)
 
-        response, error = fetch_page(url, session)
-        
+        html, error = fetch_page(url, driver)
+
         if error:
             if len(visited) == 1:  # Only log first page errors
                 print(f"   ❌ {error}")
             errors.append({"url": url, "error": error})
             # Don't stop on errors, keep trying other pages
             continue
-        
-        if len(visited) == 1:
-            print(f"   ✅ Connected")
 
-        if "text/html" not in response.headers.get("Content-Type", ""):
-            continue
+        if len(visited) == 1:
+            print(f"   ✅ Connected (browser)")
 
         # Extract text
-        text = extract_text(response.text)
+        text = extract_text(html)
         if len(text) < 200:
             continue  # too small
 
         section = classify_section(urlparse(url).path)
 
-        scraped_pages.append({
-            "company_id": company_id,
-            "company_name": company_name,
-            "url": url,
-            "section": section,
-            "text": text
-        })
+        scraped_pages.append(
+            {
+                "company_id": company_id,
+                "company_name": company_name,
+                "url": url,
+                "section": section,
+                "text": text,
+            }
+        )
 
         if len(scraped_pages) == 1:
             print(f"   📄 Extracted {len(text)} chars")
 
         # Find more internal links
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             link = urljoin(url, a["href"])
             if domain in urlparse(link).netloc:
@@ -136,7 +159,6 @@ def scrape_site(company_id, company_name, base_url):
 
         time.sleep(1)  # Simple 1-second delay
 
-    session.close()
     return scraped_pages, errors
 
 
@@ -167,22 +189,24 @@ def save_failed_csv(failed_path, failed_companies):
         writer = csv.DictWriter(f, fieldnames=["name", "location", "website_url"])
         writer.writeheader()
         for company in failed_companies:
-            writer.writerow({
-                "name": company["company_name"],
-                "location": company.get("location", "US"),
-                "website_url": company["url"]
-            })
+            writer.writerow(
+                {
+                    "name": company["company_name"],
+                    "location": company.get("location", "US"),
+                    "website_url": company["url"],
+                }
+            )
 
 
 def main():
     # Updated paths to match project structure
-    input_csv = "data/scraped_websites/failed_companies.csv"
-    output_path = Path("data/scraped_websites/website_text1.json")
-    failed_csv_path = Path("data/scraped_websites/failed_companies1.csv")
+    input_csv = "data/tmp/companies_with_sites.csv"
+    output_path = Path("data/scraped_websites/website_text.json")
+    failed_csv_path = Path("data/scraped_websites/failed_companies.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     print("=" * 70)
-    print("COMPANY WEBSITE SCRAPER - Simple & Reliable")
+    print("COMPANY WEBSITE SCRAPER - Browser-Based Scraping")
     print("=" * 70)
     print()
 
@@ -191,10 +215,20 @@ def main():
         print(f"   Please run 01_resolve_websites.py first")
         return
 
+    # Initialize browser
+    print("🌐 Initializing browser...")
+    driver = init_browser()
+    if not driver:
+        print("❌ Failed to initialize browser. Exiting.")
+        return
+    print("✓ Browser initialized (headless Chrome)\n")
+
     # Load existing data to resume from where we left off
     all_data, scraped_companies = load_existing_data(output_path)
     if scraped_companies:
-        print(f"📁 Found existing data with {len(scraped_companies)} companies already scraped")
+        print(
+            f"📁 Found existing data with {len(scraped_companies)} companies already scraped"
+        )
         print(f"   Resuming from where we left off...\n")
 
     with open(input_csv, newline="", encoding="utf-8") as f:
@@ -202,8 +236,15 @@ def main():
 
     print(f"✓ Loaded {len(companies)} companies from CSV")
     print(f"✓ Max pages per site: {MAX_PAGES}")
-    
-    remaining = len([c for c in companies if c.get("name", "Unknown") not in scraped_companies and c.get("website_url", "").strip()])
+
+    remaining = len(
+        [
+            c
+            for c in companies
+            if c.get("name", "Unknown") not in scraped_companies
+            and c.get("website_url", "").strip()
+        ]
+    )
     if remaining > 0:
         print(f"✓ Remaining to scrape: {remaining}")
     print()
@@ -213,56 +254,62 @@ def main():
     failed_count = 0
     failed_companies = []
 
-    for idx, row in enumerate(companies, 1):
-        base_url = row.get("website_url", "").strip()
-        company_name = row.get("name", "Unknown")
-        location = row.get("location", "US")
+    try:
+        for idx, row in enumerate(companies, 1):
+            base_url = row.get("website_url", "").strip()
+            company_name = row.get("name", "Unknown")
+            location = row.get("location", "US")
 
-        if not base_url:
-            skipped_count += 1
-            continue
+            if not base_url:
+                skipped_count += 1
+                continue
 
-        # Skip if already scraped
-        if company_name in scraped_companies:
+            # Skip if already scraped
+            if company_name in scraped_companies:
+                print(f"[{idx}/{len(companies)}] {company_name}")
+                print(f"   ✓ Already scraped (skipped)")
+                continue
+
+            # Use index as company_id if not present
+            company_id = row.get("company_id", str(idx))
+
             print(f"[{idx}/{len(companies)}] {company_name}")
-            print(f"   ✓ Already scraped (skipped)")
-            continue
+            print(f"   URL: {base_url}")
 
-        # Use index as company_id if not present
-        company_id = row.get("company_id", str(idx))
+            pages, errors = scrape_site(company_id, company_name, base_url, driver)
 
-        print(f"[{idx}/{len(companies)}] {company_name}")
-        print(f"   URL: {base_url}")
+            if pages:
+                all_data.extend(pages)
+                scraped_count += 1
+                print(f"   ✓ Scraped {len(pages)} pages")
 
-        pages, errors = scrape_site(company_id, company_name, base_url)
-        
-        if pages:
-            all_data.extend(pages)
-            scraped_count += 1
-            print(f"   ✓ Scraped {len(pages)} pages")
-            
-            # Save immediately after each company
-            save_data(output_path, all_data)
-            print(f"   💾 Saved")
-        else:
-            # Track failed company
-            failed_count += 1
-            failed_info = {
-                "company_name": company_name,
-                "location": location,
-                "url": base_url,
-                "errors": errors,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            failed_companies.append(failed_info)
-            
-            # Save failed companies as CSV
-            save_failed_csv(failed_csv_path, failed_companies)
-            
-            print(f"   ⚠️  No pages scraped - saved to failed CSV")
-            if errors:
-                error_summary = errors[0]["error"] if errors else "Unknown"
-                print(f"   📝 Error: {error_summary}")
+                # Save immediately after each company
+                save_data(output_path, all_data)
+                print(f"   💾 Saved")
+            else:
+                # Track failed company
+                failed_count += 1
+                failed_info = {
+                    "company_name": company_name,
+                    "location": location,
+                    "url": base_url,
+                    "errors": errors,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                failed_companies.append(failed_info)
+
+                # Save failed companies as CSV
+                save_failed_csv(failed_csv_path, failed_companies)
+
+                print(f"   ⚠️  No pages scraped - saved to failed CSV")
+                if errors:
+                    error_summary = errors[0]["error"] if errors else "Unknown"
+                    print(f"   📝 Error: {error_summary}")
+
+    finally:
+        # Always close the browser
+        print("\n🌐 Closing browser...")
+        driver.quit()
 
     print()
     print("=" * 70)
