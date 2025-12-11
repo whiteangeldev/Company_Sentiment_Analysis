@@ -43,70 +43,16 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 consecutive_rate_limits = 0
 backoff_multiplier = 1.0
 
-# US State codes
-US_STATES = {
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", 
-    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", 
-    "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", 
-    "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", 
-    "WI", "WY"
-}
-
-
-def clean_company_name(name: str) -> str:
-    """
-    Extract core company name from full name with location/division info
-    Example: "FNAC - Fujifilm Greenwood SC - Primary" -> "Fujifilm"
-    """
-    DIVISION_KEYWORDS = {
-        "PRIMARY", "PRODUCTION", "DIRECT", "INDIRECT", "PAYROLL", 
-        "DAILY", "ROOT", "CTO", "PACKAGING", "SANITATION", 
-        "MAIN WAREHOUSE", "FINISHING"
-    }
-    
-    BUSINESS_SUFFIXES = [
-        " LLC", " Inc", " Inc.", " Ltd", " Limited", 
-        " Corporation", " Corp", " Corp.", " Co", " Co."
-    ]
-    
-    # Split by " - " and filter out division keywords
-    if " - " in name:
-        parts = [p.strip() for p in name.split(" - ")]
-        parts = [p for p in parts 
-                if not any(kw in p.upper() for kw in DIVISION_KEYWORDS)]
-        
-        if len(parts) > 1:
-            # Prefer longest part that doesn't end with state code
-            candidates = [p for p in parts 
-                         if not (p.split() and p.split()[-1].upper() in US_STATES)]
-            name = max(candidates, key=len) if candidates else parts[0]
-        elif parts:
-            name = parts[0]
-    
-    # Remove parentheses content
-    name = name.split("(")[0].strip()
-    
-    # Remove trailing location (state code and possibly city)
-    words = name.split()
-    if len(words) >= 2 and words[-1].upper() in US_STATES:
-        name = " ".join(words[:-2] if len(words) > 2 and words[-2][0].isupper() else words[:-1])
-    
-    # Remove business suffixes
-    for suffix in BUSINESS_SUFFIXES:
-        if name.upper().endswith(suffix.upper()):
-            name = name[:-len(suffix)].strip()
-    
-    return name.strip().strip(",").strip() or "Unknown"
-
 
 def search_review_site_duckduckgo(
-    company_name: str, platform: str, retry_count: int = 0
+    company_name: str, location: str, platform: str, retry_count: int = 0
 ):
     """
     Search for company reviews on any platform using DuckDuckGo
 
     Args:
-        company_name: Company name to search for
+        company_name: Company name to search for (from CSV column 1)
+        location: Location/nationality (from CSV column 2)
         platform: One of 'glassdoor', 'indeed', 'comparably', 'kununu', 'ambitionbox'
         retry_count: Current retry attempt
 
@@ -115,30 +61,33 @@ def search_review_site_duckduckgo(
     """
     global consecutive_rate_limits, backoff_multiplier
 
+    # Create search index: company name + location
+    search_index = f"{company_name} {location}"
+
     # Platform-specific search queries and URL patterns
     platform_config = {
         "glassdoor": {
-            "query": f"{company_name} glassdoor reviews",
+            "query": f"{search_index} glassdoor employee reviews",
             "domains": ["glassdoor.com", "glassdoor.co.uk", "glassdoor.ca"],
             "paths": ["/Reviews/", "/reviews/", "-Reviews-"],
         },
         "indeed": {
-            "query": f"{company_name} indeed company reviews",
+            "query": f"{search_index} indeed employee reviews",
             "domains": ["indeed.com", "indeed.co.uk", "indeed.ca"],
             "paths": ["/cmp/", "/companies/", "/reviews"],
         },
         "comparably": {
-            "query": f"{company_name} comparably reviews",
+            "query": f"{search_index} comparably employee reviews",
             "domains": ["comparably.com"],
             "paths": ["/companies/", "/reviews"],
         },
         "kununu": {
-            "query": f"{company_name} kununu reviews",
+            "query": f"{search_index} kununu employee reviews",
             "domains": ["kununu.com", "kununu.de", "kununu.at"],
             "paths": ["/bewertung/", "/reviews/", "/en/"],
         },
         "ambitionbox": {
-            "query": f"{company_name} ambitionbox reviews",
+            "query": f"{search_index} ambitionbox employee reviews",
             "domains": ["ambitionbox.com"],
             "paths": ["/reviews/", "/company/"],
         },
@@ -181,7 +130,7 @@ def search_review_site_duckduckgo(
                 )
                 time.sleep(wait_time)
                 return search_review_site_duckduckgo(
-                    company_name, platform, retry_count + 1
+                    company_name, location, platform, retry_count + 1
                 )
             else:
                 return None
@@ -208,11 +157,14 @@ def search_review_site_duckduckgo(
             # Check if URL matches platform's domains and paths
             domain_match = any(domain in url_lower for domain in config["domains"])
             path_match = any(path.lower() in url_lower for path in config["paths"])
-            
+
             if domain_match and path_match:
                 # Additional validation for specific platforms
                 if platform == "ambitionbox":
-                    if "ambition-box-reviews" in url_lower or "ambitionbox-reviews" in url_lower:
+                    if (
+                        "ambition-box-reviews" in url_lower
+                        or "ambitionbox-reviews" in url_lower
+                    ):
                         continue
                 if platform == "comparably":
                     if "/companies/" not in url_lower:
@@ -225,17 +177,17 @@ def search_review_site_duckduckgo(
         return None
 
 
-def generate_manual_search_urls(company_name: str):
+def generate_manual_search_urls(company_name: str, location: str):
     """Generate search URLs for manual review collection"""
-    clean_name = clean_company_name(company_name)
-    encoded_name = quote_plus(clean_name)
+    search_index = f"{company_name} {location}"
+    encoded_name = quote_plus(search_index)
 
     return {
         "glassdoor_search": f"https://www.glassdoor.com/Search/results.htm?keyword={encoded_name}",
-        "indeed_search": f"https://www.indeed.com/cmp/{encoded_name.replace(' ', '-')}/reviews",
-        "comparably_search": f"https://www.google.com/search?q={encoded_name}+comparably+reviews",
-        "kununu_search": f"https://www.google.com/search?q={encoded_name}+kununu+reviews",
-        "ambitionbox_search": f"https://www.google.com/search?q={encoded_name}+ambitionbox+reviews",
+        "indeed_search": f"https://www.indeed.com/cmp/{quote_plus(company_name).replace(' ', '-')}/reviews",
+        "comparably_search": f"https://www.google.com/search?q={encoded_name}+comparably+employee+reviews",
+        "kununu_search": f"https://www.google.com/search?q={encoded_name}+kununu+employee+reviews",
+        "ambitionbox_search": f"https://www.google.com/search?q={encoded_name}+ambitionbox+employee+reviews",
     }
 
 
@@ -252,7 +204,11 @@ def load_progress():
     if os.path.exists(PROGRESS_JSON):
         with open(PROGRESS_JSON, encoding="utf-8") as f:
             data = json.load(f)
-            return {item["original_name"]: item for item in data}
+            # Use company_name as key (backward compatible with old format)
+            return {
+                item.get("company_name", item.get("original_name", "")): item
+                for item in data
+            }
     return {}
 
 
@@ -266,24 +222,28 @@ def collect_reviews_for_company(
     Collect review links for a company from multiple platforms
 
     Args:
-        company_name: Name of the company
-        location: Location (US, UK, etc.)
+        company_name: Name of the company (from CSV column 1)
+        location: Location/nationality (from CSV column 2)
         method: 'duckduckgo' or 'manual'
         platforms_to_search: List of platforms to search
 
     Returns:
         Dictionary with URLs for all review platforms
     """
-    clean_name = clean_company_name(company_name)
-
     # Default to all 5 platforms
     if platforms_to_search is None:
-        platforms_to_search = ["glassdoor", "indeed", "comparably", "kununu", "ambitionbox"]
+        platforms_to_search = [
+            "glassdoor",
+            "indeed",
+            "comparably",
+            "kununu",
+            "ambitionbox",
+        ]
 
     result = {
-        "original_name": company_name,
-        "clean_name": clean_name,
+        "company_name": company_name,
         "location": location,
+        "search_index": f"{company_name} {location}",
         "glassdoor_url": "",
         "indeed_url": "",
         "comparably_url": "",
@@ -293,10 +253,10 @@ def collect_reviews_for_company(
     }
 
     if method == "duckduckgo":
-        # Search each platform
+        # Search each platform using company name + location
         found_count = 0
         for platform in platforms_to_search:
-            url = search_review_site_duckduckgo(clean_name, platform)
+            url = search_review_site_duckduckgo(company_name, location, platform)
             if url:
                 result[f"{platform}_url"] = url
                 print(f"   ✓ {platform.capitalize()}: {url}")
@@ -308,7 +268,7 @@ def collect_reviews_for_company(
             print(f"   → Found on {found_count}/{len(platforms_to_search)} platforms")
 
     # Always generate manual search URLs as fallback
-    manual_urls = generate_manual_search_urls(company_name)
+    manual_urls = generate_manual_search_urls(company_name, location)
     for platform in ["glassdoor", "indeed", "comparably", "kununu", "ambitionbox"]:
         result[f"{platform}_search_url"] = manual_urls[f"{platform}_search"]
 
@@ -331,12 +291,14 @@ def main():
     # Method
     method = "duckduckgo"
     print("✓ Using DuckDuckGo (free, no API key needed)")
-    
+
     # Choose platforms to search
     print()
     print("Which review platforms do you want to search?")
     print("  1. Glassdoor + Indeed only (RECOMMENDED - most reliable)")
-    print("  2. All 5 platforms (slower, less reliable for Comparably/Kununu/AmbitionBox)")
+    print(
+        "  2. All 5 platforms (slower, less reliable for Comparably/Kununu/AmbitionBox)"
+    )
     print()
     choice = input("Enter choice (1/2) [default: 2]: ").strip() or "2"
 
@@ -344,7 +306,13 @@ def main():
         platforms_to_search = ["glassdoor", "indeed"]
         print("→ Searching Glassdoor + Indeed only")
     else:
-        platforms_to_search = ["glassdoor", "indeed", "comparably", "kununu", "ambitionbox"]
+        platforms_to_search = [
+            "glassdoor",
+            "indeed",
+            "comparably",
+            "kununu",
+            "ambitionbox",
+        ]
         print("→ Searching all 5 platforms")
 
     print()
@@ -442,8 +410,7 @@ def main():
 
     # Count companies with at least one URL
     companies_with_reviews = sum(
-        1 for r in all_results
-        if any(r.get(f"{p}_url") for p in platforms_to_search)
+        1 for r in all_results if any(r.get(f"{p}_url") for p in platforms_to_search)
     )
 
     print()
