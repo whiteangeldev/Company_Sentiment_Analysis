@@ -71,7 +71,108 @@ DELAY_BETWEEN_PLATFORMS = (15, 20)  # Seconds between platform switches
 DELAY_AFTER_API_CALL = 2  # Base delay after every API call
 
 # ScraperAPI configuration
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+API_KEY_STATE_FILE = f"{OUTPUT_DIR}/api_key_state.json"  # Track which key is active
+
+
+class APIKeyManager:
+    """Manages multiple ScraperAPI keys and auto-rotates on 403 errors"""
+    
+    def __init__(self):
+        self.api_keys = self._load_api_keys()
+        self.current_key_index = 0
+        self.failed_keys = set()
+        self._load_state()
+    
+    def _load_api_keys(self):
+        keys = []
+        # Try loading SCRAPERAPI_KEY_1 through SCRAPERAPI_KEY_4
+        for i in range(1, 5):
+            key = os.getenv(f"SCRAPERAPI_KEY_{i}", "")
+            if key and key.strip():
+                keys.append(key.strip())
+        
+        # Fallback to single SCRAPERAPI_KEY if numbered keys not found
+        if not keys:
+            single_key = os.getenv("SCRAPERAPI_KEY", "")
+            if single_key and single_key.strip():
+                keys.append(single_key.strip())
+        
+        return keys
+    
+    def _load_state(self):
+        try:
+            if Path(API_KEY_STATE_FILE).exists():
+                with open(API_KEY_STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                    self.current_key_index = state.get('current_key_index', 0)
+                    self.failed_keys = set(state.get('failed_keys', []))
+        except Exception as e:
+            pass  # Silent fail - will start fresh
+    
+    def _save_state(self):
+        try:
+            state = {
+                'current_key_index': self.current_key_index,
+                'failed_keys': list(self.failed_keys),
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(API_KEY_STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            pass  # Silent fail
+    
+    def get_current_key(self):
+        if not self.api_keys:
+            return None
+        
+        # Skip failed keys
+        attempts = 0
+        while attempts < len(self.api_keys):
+            if self.current_key_index not in self.failed_keys:
+                return self.api_keys[self.current_key_index]
+            
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            attempts += 1
+        
+        # All keys failed
+        return None
+    
+    def rotate_key(self, reason="403_error"):
+        if not self.api_keys or len(self.api_keys) == 1:
+            return False
+        
+        # Mark current key as failed
+        self.failed_keys.add(self.current_key_index)
+        old_index = self.current_key_index
+        
+        # Try to find next available key
+        for _ in range(len(self.api_keys)):
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            if self.current_key_index not in self.failed_keys:
+                print(f"      🔄 API Key Rotated: #{old_index + 1} → #{self.current_key_index + 1} (Reason: {reason})")
+                self._save_state()
+                return True
+        
+        # All keys failed
+        print(f"      ❌ All {len(self.api_keys)} API keys exhausted!")
+        return False
+    
+    def get_status(self):
+        total_keys = len(self.api_keys)
+        failed_count = len(self.failed_keys)
+        active_count = total_keys - failed_count
+        
+        return {
+            'total_keys': total_keys,
+            'active_keys': active_count,
+            'failed_keys': failed_count,
+            'current_key': self.current_key_index + 1 if total_keys > 0 else 0
+        }
+
+
+# Initialize global API key manager
+api_key_manager = APIKeyManager()
+SCRAPERAPI_KEY = api_key_manager.get_current_key() or ""
 USE_SCRAPERAPI = len(SCRAPERAPI_KEY) > 0
 SCRAPERAPI_PLATFORMS = ["glassdoor", "indeed"]  # Only use for these platforms
 
@@ -192,19 +293,7 @@ def generate_indeed_page_urls(base_url, max_pages=10):
     return urls
 
 
-def scrape_with_scraperapi(url, render=True, retry=0, max_retries=2):
-    """
-    Scrape a URL using ScraperAPI to bypass Cloudflare
-
-    Args:
-        url: Target URL to scrape
-        render: Whether to render JavaScript (default True for SPA sites)
-        retry: Current retry attempt
-        max_retries: Maximum number of retries for 500 errors
-
-    Returns:
-        HTML content as string, or None if failed
-    """
+def scrape_with_scraperapi(url, render=True, retry=0, max_retries=5, try_alternative_params=False):
     if not SCRAPERAPI_KEY:
         print("      ⚠️  ScraperAPI key not found in environment")
         return None
@@ -225,11 +314,31 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=2):
             return None
 
         # Keep params minimal to avoid 400 errors
+        # Get current API key from manager (supports rotation)
+        current_key = api_key_manager.get_current_key()
+        if not current_key:
+            print(f"      ❌ No API keys available")
+            return None
+        
+        # Build params - try alternative params on retry if needed
         params = {
-            "api_key": SCRAPERAPI_KEY,
+            "api_key": current_key,
             "url": url,
-            "render": "true",
         }
+        
+        # Try different strategies on retry
+        if try_alternative_params and retry >= 2:
+            # Strategy 1: Try without render (faster, less resource-intensive)
+            params["render"] = "false"
+            print(f"      🔄 Trying without render parameter...")
+        elif retry >= 3:
+            # Strategy 2: Try with country code for international sites
+            if "uk.indeed.com" in url:
+                params["country_code"] = "uk"
+                print(f"      🔄 Trying with UK country code...")
+            params["render"] = "true"
+        else:
+            params["render"] = "true"
 
         api_url = "http://api.scraperapi.com"
 
@@ -237,15 +346,16 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=2):
         if retry == 0 and "glassdoor" in url:
             print(f"      🔍 URL: {url[:80]}...")
 
-        # Add exponential backoff delay between retries
+        # Add exponential backoff delay between retries (longer waits for 500 errors)
         if retry > 0:
-            wait_time = retry * 5  # Increased from 3 to 5 seconds per retry
+            # Exponential backoff: 10s, 20s, 30s, 45s, 60s
+            wait_time = min(10 * retry + (retry - 1) * 5, 60)
             print(
                 f"      ⏳ Waiting {wait_time}s before retry {retry}/{max_retries}..."
             )
             time.sleep(wait_time)
 
-        response = requests.get(api_url, params=params, timeout=90)
+        response = requests.get(api_url, params=params, timeout=120)  # Increased timeout
 
         if response.status_code == 200:
             print(f"      ✓ ScraperAPI success (status: {response.status_code})")
@@ -253,12 +363,25 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=2):
             time.sleep(DELAY_AFTER_API_CALL)
             return response.text
 
-        elif response.status_code == 500 and retry < max_retries:
-            # Retry on 500 errors (server issues)
-            print(
-                f"      ⚠️  ScraperAPI 500 error - retrying ({retry + 1}/{max_retries})..."
-            )
-            return scrape_with_scraperapi(url, render, retry + 1, max_retries)
+        elif response.status_code == 500:
+            # Enhanced 500 error handling
+            if retry < max_retries:
+                print(
+                    f"      ⚠️  ScraperAPI 500 error - retrying ({retry + 1}/{max_retries})..."
+                )
+                
+                # Try rotating API key on 500 errors (if multiple keys available)
+                if retry >= 2 and len(api_key_manager.api_keys) > 1:
+                    if api_key_manager.rotate_key(reason="500_server_error"):
+                        print(f"      🔄 Rotated API key due to persistent 500 errors")
+                        time.sleep(5)  # Brief pause after key rotation
+                
+                # Try alternative params after a few retries
+                use_alt_params = retry >= 2
+                return scrape_with_scraperapi(url, render, retry + 1, max_retries, use_alt_params)
+            else:
+                print(f"      ❌ ScraperAPI 500 error - max retries ({max_retries}) exceeded")
+                return None
 
         elif response.status_code == 400:
             print(f"      ⚠️  ScraperAPI 400: Bad Request - URL might be malformed")
@@ -267,12 +390,31 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=2):
             return None
 
         elif response.status_code == 403:
-            print(f"      ⚠️  ScraperAPI 403: API key issue or credits exhausted")
+            print(f"      ⚠️  ScraperAPI 403: API key credits exhausted")
+            
+            # Try to rotate to next API key and retry
+            if api_key_manager.rotate_key(reason="403_credits_exhausted") and retry < max_retries:
+                print(f"      🔄 Retrying with new API key...")
+                time.sleep(3)  # Brief pause before retry
+                return scrape_with_scraperapi(url, render, retry + 1, max_retries)
+            
             return None
 
         elif response.status_code == 404:
             print(f"      ⚠️  ScraperAPI 404: Target URL not found")
-            return None
+            # Try to fix common URL issues before giving up
+            if retry == 0:
+                # Try fixing URL if it's missing /reviews
+                if "indeed.com/cmp/" in url and not url.endswith("/reviews") and "/reviews" not in url:
+                    fixed_url = url.rstrip("/") + "/reviews"
+                    print(f"      🔄 Trying fixed URL (added /reviews)...")
+                    time.sleep(2)
+                    # Recursively try with fixed URL (but don't increment retry to avoid double counting)
+                    fixed_result = scrape_with_scraperapi(fixed_url, render, 0, max_retries, try_alternative_params)
+                    if fixed_result and fixed_result != "NO_MORE_PAGES":
+                        return fixed_result
+            # Return special value - caller will decide if it's an error (first page) or expected (subsequent pages)
+            return "NO_MORE_PAGES"
 
         else:
             print(f"      ⚠️  ScraperAPI returned status: {response.status_code}")
@@ -443,15 +585,58 @@ def parse_glassdoor_html(html, max_reviews=10):
     return reviews
 
 
+def clean_review_text(text):
+    import re
+    
+    if not text:
+        return text
+    
+    # List of truncation indicators to remove
+    truncation_phrases = [
+        'Show more',
+        'Read more', 
+        'Show full review',
+        'Read full review',
+        'See more',
+        'View more',
+        'Continue reading',
+        'Expand review',
+    ]
+    
+    # Remove truncation indicators (case-insensitive)
+    cleaned = text
+    for phrase in truncation_phrases:
+        # Remove the phrase and surrounding whitespace/punctuation
+        pattern = re.compile(r'\s*' + re.escape(phrase) + r'\s*\.{0,3}\s*', re.IGNORECASE)
+        cleaned = pattern.sub(' ', cleaned)
+    
+    # Clean up excessive whitespace
+    cleaned = ' '.join(cleaned.split())
+    
+    # Remove trailing ellipsis if text is truncated
+    cleaned = re.sub(r'\s*\.{2,}\s*$', '', cleaned)
+    
+    # Remove "..." in the middle if followed by limited text (likely truncation)
+    cleaned = re.sub(r'\.\.\.\s*$', '', cleaned)
+    
+    return cleaned.strip()
+
+
 def parse_indeed_html(html, max_reviews=10):
-    """Parse Indeed reviews from HTML - simple format"""
     reviews = []
 
     try:
         soup = BeautifulSoup(html, "html.parser")
 
-        # Try multiple selectors for Indeed reviews
+        # Try multiple selectors for Indeed reviews (Updated 2024/2025)
         review_selectors = [
+            # Modern Indeed selectors (2024/2025)
+            '[data-testid="review-card"]',
+            '[data-testid="review"]',
+            '[id*="cmp-review-"]',
+            'div[class*="css-"][id*="review"]',  # Indeed uses CSS-in-JS
+            
+            # Legacy selectors (fallback)
             '[data-tn-component="reviews"]',
             '[class*="review-item"]',
             '[class*="ReviewItem"]',
@@ -460,22 +645,26 @@ def parse_indeed_html(html, max_reviews=10):
         ]
 
         review_elements = []
+        matched_selector = None
         for selector in review_selectors:
             review_elements = soup.select(selector)
-            if review_elements and len(review_elements) > 3:
+            # FIXED: Accept ANY reviews found (not just >3)
+            if review_elements and len(review_elements) >= 1:
+                matched_selector = selector
                 break
 
         if not review_elements:
             print("      ⚠️  No review elements found in HTML")
             return reviews
 
-        print(f"      Found {len(review_elements[:max_reviews])} review elements")
+        print(f"      Found {len(review_elements)} review elements (using selector: {matched_selector[:40]}...)")
 
         for idx, element in enumerate(review_elements[:max_reviews], 1):
             try:
                 # Extract topic/title
                 topic = ""
                 topic_selectors = [
+                    '[data-testid="review-title"]',
                     '[class*="review-title"]',
                     '[class*="ReviewTitle"]',
                     '[itemprop="name"]',
@@ -490,37 +679,78 @@ def parse_indeed_html(html, max_reviews=10):
                         if topic and len(topic) > 3:
                             break
 
-                # Extract review text
+                # Extract review text - with expanded content support
                 text = ""
-                text_selectors = [
-                    '[itemprop="reviewBody"]',
-                    '[class*="review-text"]',
-                    '[class*="ReviewText"]',
-                    "p",
+                
+                # Strategy 1: Look for expanded/full content in hidden elements
+                full_text_selectors = [
+                    '[class*="expanded"]',  # Expanded content
+                    '[class*="full-text"]',  # Full text container
+                    '[class*="full-review"]',  # Full review
+                    '[style*="display:none"]',  # Hidden content
+                    '[class*="collapsed"]',  # Collapsed content
                 ]
-                for selector in text_selectors:
-                    text_elem = element.select_one(selector)
-                    if text_elem:
-                        text = text_elem.get_text(strip=True)
-                        if text and len(text) > 50:
+                
+                for selector in full_text_selectors:
+                    full_elem = element.select_one(selector)
+                    if full_elem:
+                        potential_text = full_elem.get_text(separator=' ', strip=True)
+                        if potential_text and len(potential_text) > len(text):
+                            text = potential_text
                             break
+                
+                # Strategy 2: Standard text extraction
+                if not text or len(text) < 50:  # If we don't have good text yet
+                    text_selectors = [
+                        '[data-testid="review-text"]',
+                        '[itemprop="reviewBody"]',
+                        '[class*="review-text"]',
+                        '[class*="ReviewText"]',
+                        '[class*="reviewText"]',
+                        "p",
+                        "span",
+                    ]
+                    for selector in text_selectors:
+                        text_elem = element.select_one(selector)
+                        if text_elem:
+                            # Try to get full text from all child elements (including hidden ones)
+                            potential_text = text_elem.get_text(separator=' ', strip=True)
+                            if potential_text and len(potential_text) > len(text):
+                                text = potential_text
+                            # FIXED: Reduced from 50 to 20 characters
+                            if text and len(text) > 20:
+                                break
 
+                # Strategy 3: Fallback to all text in element
                 if not text:
-                    text = element.get_text(strip=True)
+                    text = element.get_text(separator=' ', strip=True)
+                
+                # POST-PROCESSING: Remove "Show more" artifacts
+                if text:
+                    text = clean_review_text(text)
 
                 # Extract rating
                 rating = None
-                rating_elem = element.select_one('[itemprop="ratingValue"]')
-                if rating_elem:
-                    try:
-                        rating = float(
-                            rating_elem.get("content", "") or rating_elem.get_text()
-                        )
-                    except:
-                        pass
+                rating_selectors = [
+                    '[itemprop="ratingValue"]',
+                    '[data-testid="rating"]',
+                    '[class*="rating"]',
+                ]
+                for selector in rating_selectors:
+                    rating_elem = element.select_one(selector)
+                    if rating_elem:
+                        try:
+                            rating = float(
+                                rating_elem.get("content", "") 
+                                or rating_elem.get("aria-label", "").split()[0]
+                                or rating_elem.get_text()
+                            )
+                            break
+                        except:
+                            pass
 
-                # Only add if we have meaningful content
-                if text and len(text) > 50:
+                # FIXED: Reduced minimum text length from 50 to 20
+                if text and len(text) > 20:
                     reviews.append(
                         {
                             "topic": topic or None,
@@ -541,6 +771,83 @@ def parse_indeed_html(html, max_reviews=10):
     except Exception as e:
         print(f"      ❌ HTML parsing error: {str(e)[:60]}")
 
+    return reviews
+
+
+def parse_indeed_html_fallback(html, max_reviews=10, company_name="unknown"):
+    reviews = []
+    seen_texts = set()  # Track duplicates
+    
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # Look for divs/sections that might contain reviews
+        # Reviews typically have certain patterns: rating + text + date
+        all_containers = soup.find_all(['div', 'article', 'section', 'li'])
+        
+        for container in all_containers[:max_reviews * 5]:  # Check more containers
+            try:
+                text = container.get_text(separator=' ', strip=True)
+                
+                # Skip if we've seen this text before (avoid duplicates)
+                text_signature = text[:100].lower()
+                if text_signature in seen_texts:
+                    continue
+                
+                # Check if it looks like a review:
+                # - Reasonable length (between 30 and 2000 chars)
+                # - Contains common review keywords
+                review_keywords = [
+                    'work', 'company', 'job', 'management', 'employee', 
+                    'culture', 'team', 'salary', 'benefit', 'environment',
+                    'position', 'manager', 'experience', 'staff', 'coworker',
+                    'colleague', 'workplace', 'supervisor', 'boss', 'pay',
+                    'overtime', 'shift', 'schedule', 'hour', 'training',
+                    'promotion', 'career', 'hired', 'interview', 'quit'
+                ]
+                
+                if 30 <= len(text) <= 2000:
+                    # Check if text contains review-like language
+                    text_lower = text.lower()
+                    keyword_matches = sum(1 for kw in review_keywords if kw in text_lower)
+                    
+                    # If we find multiple review keywords, it's likely a review
+                    # Lowered threshold from 2 to 1 for broader matching
+                    if keyword_matches >= 1:
+                        # Try to extract a title/topic from headers within this container
+                        topic = None
+                        for header in container.find_all(['h2', 'h3', 'h4', 'h5', 'strong', 'b']):
+                            header_text = header.get_text(strip=True)
+                            if 3 < len(header_text) < 100:
+                                topic = header_text
+                                break
+                        
+                        seen_texts.add(text_signature)
+                        
+                        # Clean the text to remove "Show more..." artifacts
+                        cleaned_text = clean_review_text(text)
+                        
+                        reviews.append({
+                            "topic": topic,
+                            "text": cleaned_text,
+                            "rating": None,
+                            "platform": "indeed",
+                            "scraped_at": datetime.now().isoformat(),
+                            "method": "scraperapi_fallback",
+                        })
+                        
+                        if len(reviews) >= max_reviews:
+                            break
+                            
+            except Exception as e:
+                continue
+        
+        if reviews:
+            print(f"      🔄 Fallback parser found {len(reviews)} potential reviews")
+        
+    except Exception as e:
+        print(f"      ⚠️  Fallback parser error: {str(e)[:60]}")
+    
     return reviews
 
 
@@ -867,11 +1174,12 @@ def scrape_generic_reviews(driver, url, platform_name, max_reviews=10):
     return reviews
 
 
-def scrape_reviews_from_url(url, platform, max_reviews=10):
+def scrape_reviews_from_url(url, platform, max_reviews=10, company_name="unknown"):
     """
     Scrape reviews from a URL
     - Uses ScraperAPI for Glassdoor and Indeed (bypasses Cloudflare)
     - Uses undetected Chrome for other platforms (free)
+    - Includes fallback parser for difficult pages
 
     Returns: (reviews, success, error_message)
     """
@@ -886,6 +1194,10 @@ def scrape_reviews_from_url(url, platform, max_reviews=10):
         try:
             html = scrape_with_scraperapi(url, render=True)
 
+            # Handle special "NO_MORE_PAGES" return value for expected 404s
+            if html == "NO_MORE_PAGES":
+                return [], False, "No more pages (404)"  # Expected for subsequent pages
+            
             if not html:
                 return [], False, "ScraperAPI failed to fetch content"
 
@@ -897,9 +1209,49 @@ def scrape_reviews_from_url(url, platform, max_reviews=10):
             else:
                 reviews = []
 
+            # NEW: Try fallback parser if primary parser found nothing
+            if not reviews and "indeed" in platform_lower:
+                print(f"      🔄 Primary parser found no reviews, trying fallback parser...")
+                reviews = parse_indeed_html_fallback(html, max_reviews, company_name)
+            
             if reviews:
                 return reviews, True, None
             else:
+                # Save HTML for debugging if no reviews found
+                try:
+                    debug_dir = Path("data/raw_reviews/debug_html")
+                    debug_dir.mkdir(exist_ok=True)
+                    debug_file = debug_dir / f"{company_name.replace(' ', '_')[:50]}.html"
+                    
+                    # Add diagnostic information at the top of the HTML
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "html.parser")
+                    
+                    # Gather diagnostics
+                    diagnostics = f"""
+<!-- DEBUG DIAGNOSTICS FOR: {company_name} -->
+<!-- Scraped at: {datetime.now().isoformat()} -->
+<!-- URL: {url} -->
+<!-- HTML Length: {len(html)} bytes -->
+<!-- Total divs: {len(soup.find_all('div'))} -->
+<!-- Total articles: {len(soup.find_all('article'))} -->
+<!-- Total sections: {len(soup.find_all('section'))} -->
+<!-- Contains 'review': {str(html.lower().count('review'))} times -->
+<!-- Contains 'employee': {str(html.lower().count('employee'))} times -->
+<!-- Contains 'rating': {str(html.lower().count('rating'))} times -->
+<!-- Page title: {soup.title.string if soup.title else 'No title'} -->
+-->
+
+"""
+                    
+                    with open(debug_file, "w", encoding="utf-8") as f:
+                        f.write(diagnostics)
+                        f.write(html[:100000])  # Save first 100KB
+                    print(f"      💾 Saved HTML to {debug_file.name} for debugging")
+                    print(f"      📊 HTML stats: {len(html)} bytes, {len(soup.find_all('div'))} divs, 'review' appears {html.lower().count('review')} times")
+                except Exception as e:
+                    print(f"      ⚠️  Could not save debug HTML: {str(e)[:40]}")
+                
                 return [], False, "No reviews parsed from ScraperAPI response"
 
         except Exception as e:
@@ -997,6 +1349,15 @@ def main():
         companies = json.load(f)
 
     print(f"✓ Loaded {len(companies)} companies from JSON")
+    
+    # Display API key status
+    if USE_SCRAPERAPI:
+        status = api_key_manager.get_status()
+        print(f"✓ ScraperAPI Keys: {status['total_keys']} total, {status['active_keys']} active, using key #{status['current_key']}")
+        if status['failed_keys'] > 0:
+            print(f"   ⚠️  {status['failed_keys']} key(s) already exhausted")
+    else:
+        print("⚠️  ScraperAPI not configured - Limited scraping ability")
 
     # Load existing data
     all_reviews, scraped_keys = load_existing_data(REVIEWS_OUTPUT)
@@ -1086,7 +1447,7 @@ def main():
 
                 # Scrape this page
                 reviews, success, error = scrape_reviews_from_url(
-                    url, platform, MAX_REVIEWS_PER_COMPANY - len(platform_reviews)
+                    url, platform, MAX_REVIEWS_PER_COMPANY - len(platform_reviews), company_name
                 )
 
                 if success and reviews:
@@ -1096,22 +1457,38 @@ def main():
                         f"      ✓ Page {page_num}: Got {len(reviews)} reviews (Total: {len(platform_reviews)})"
                     )
                 elif page_num == 1:
-                    # If first page fails, record as failed
-                    failed_count += 1
-                    failed_items.append(
-                        {
-                            "company_name": company_name,
-                            "platform": platform,
-                            "url": url,
-                            "error": error or "Unknown error",
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
+                    # If first page fails, record as failed (unless it's expected 404)
+                    if error and "No more pages (404)" in error:
+                        # First page 404 means URL is invalid
+                        failed_count += 1
+                        failed_items.append(
+                            {
+                                "company_name": company_name,
+                                "platform": platform,
+                                "url": url,
+                                "error": "Page not found (404) - URL may be invalid",
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                        )
+                    else:
+                        failed_count += 1
+                        failed_items.append(
+                            {
+                                "company_name": company_name,
+                                "platform": platform,
+                                "url": url,
+                                "error": error or "Unknown error",
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                        )
                     save_failed_csv(Path(FAILED_FILE), failed_items)
                     break
                 else:
                     # No more reviews on this page, stop pagination
-                    if page_num > 1:
+                    # Check if it's an expected 404 (no more pages) or other error
+                    if error and "No more pages (404)" in error:
+                        print(f"      ✓ No more pages (404), stopping pagination")
+                    else:
                         print(f"      ✓ No more reviews on page {page_num}, stopping")
                     break
 

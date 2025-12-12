@@ -1,0 +1,46 @@
+PARSING FAILURES ANALYSIS
+Generated: 2025-12-11T13:11:42.106585
+======================================================================
+
+Total HTML Parsing Failures: 8
+
+1. ID Logistics 6791 West Jordan UT - Primary
+   URL: https://www.indeed.com/cmp/Id-Logistics/reviews?fcountry=US&floc=West+Jordan%2C+UT
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T09:05:51.859271
+
+2. Do &amp; Co - JFK - Primary
+   URL: https://www.indeed.com/cmp/Do-&-Co/reviews?fcountry=US&floc=John+F.+Kennedy+International+Airport%2C+NY
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T09:20:12.223177
+
+3. Assemblers, Inc - McCook - Production
+   URL: https://www.indeed.com/cmp/Assemblers,-Inc./reviews?fcountry=US&floc=McCook%2C+IL
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T09:21:02.032184
+
+4. United Facilities Wilmington IL - Wilmington
+   URL: https://www.indeed.com/cmp/United-Facilities-3/reviews?fcountry=US&floc=Wilmington%2C+IL
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T09:41:29.694319
+
+5. United Facilities Perris CA - Perris
+   URL: https://www.indeed.com/cmp/United-Facilities-General-Mills/reviews?fcountry=US&floc=Perris%2C+CA
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T10:02:23.029233
+
+6. Diversi-Pak Solutions, Inc West Chicago IL - Primary
+   URL: https://www.indeed.com/cmp/Diversipak
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T10:03:10.346865
+
+7. APS Grupa LLC - Production
+   URL: https://www.indeed.com/cmp/Aps-Grupa
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T10:59:07.083974
+
+8. BMS - Boots Management Services Ltd
+   URL: https://uk.indeed.com/cmp/Boots-Management-Services-Ltd/reviews
+   Error: No reviews parsed from ScraperAPI response
+   Timestamp: 2025-12-11T11:22:33.050759
+

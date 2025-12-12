@@ -1,44 +1,4 @@
 company_name,platform,url,error,timestamp
-ID Logistics 6791 West Jordan UT - Primary,indeed,https://www.indeed.com/cmp/Id-Logistics/reviews?fcountry=US&floc=West+Jordan%2C+UT,No reviews parsed from ScraperAPI response,2025-12-10T15:58:55.994894
-Do &amp; Co - JFK - Primary,indeed,https://www.indeed.com/cmp/Do-&-Co/reviews?fcountry=US&floc=John+F.+Kennedy+International+Airport%2C+NY,No reviews parsed from ScraperAPI response,2025-12-10T16:23:28.288085
-"Assemblers, Inc - McCook - Production",indeed,"https://www.indeed.com/cmp/Assemblers,-Inc./reviews?fcountry=US&floc=McCook%2C+IL",No reviews parsed from ScraperAPI response,2025-12-10T16:24:13.835364
-Del Monte Fresh Produce Houston (TX) - FC 1st,indeed,https://www.indeed.com/cmp/Fresh-Del-Monte-5/reviews?fcountry=US&floc=Houston%2C+TX,ScraperAPI failed to fetch content,2025-12-10T16:27:33.844017
-United Facilities Wilmington IL - Wilmington,indeed,https://www.indeed.com/cmp/United-Facilities-3/reviews?fcountry=US&floc=Wilmington%2C+IL,No reviews parsed from ScraperAPI response,2025-12-10T16:51:06.578622
-United Facilities Perris CA - Perris,indeed,https://www.indeed.com/cmp/United-Facilities-General-Mills/reviews?fcountry=US&floc=Perris%2C+CA,No reviews parsed from ScraperAPI response,2025-12-10T17:15:51.684906
-"Diversi-Pak Solutions, Inc West Chicago IL - Primary",indeed,https://www.indeed.com/cmp/Diversipak,No reviews parsed from ScraperAPI response,2025-12-10T17:17:40.424133
-APS Grupa LLC - Production,indeed,https://www.indeed.com/cmp/Aps-Grupa,No reviews parsed from ScraperAPI response,2025-12-10T18:20:25.528043
-BMS - Boots Management Services Ltd,indeed,https://uk.indeed.com/cmp/Boots-Management-Services-Ltd/reviews,No reviews parsed from ScraperAPI response,2025-12-10T18:46:06.698552
-BMS- Boots Management Services Ltd (Beehive),indeed,https://uk.indeed.com/cmp/Boots-Management-Services-Ltd/reviews,No reviews parsed from ScraperAPI response,2025-12-10T19:12:54.993479
-Shell International Ltd - Non DX,indeed,https://uk.indeed.com/cmp/Shell/reviews,ScraperAPI failed to fetch content,2025-12-10T19:19:08.251062
-Boots UK Ltd,indeed,https://uk.indeed.com/cmp/Boots-73b08684/reviews,ScraperAPI failed to fetch content,2025-12-10T19:19:26.894527
-The Insolvency Service,indeed,https://uk.indeed.com/cmp/Insolvency-Service/reviews,ScraperAPI failed to fetch content,2025-12-10T19:19:47.215893
-Chelsea Football Club Women Limited,indeed,https://uk.indeed.com/cmp/Chelsea-Football-Club/reviews,ScraperAPI failed to fetch content,2025-12-10T19:20:06.957421
-Manchester Metropolitan University,indeed,https://uk.indeed.com/cmp/Manchester-Metropolitan-University/reviews,ScraperAPI failed to fetch content,2025-12-10T19:20:23.804352
-Innovate UK - Monthly  - Primary ,indeed,https://uk.indeed.com/cmp/Innovate-Uk/reviews,ScraperAPI failed to fetch content,2025-12-10T19:20:41.451547
-NHS NORTH WEST LONDON ICB,indeed,https://uk.indeed.com/cmp/Nhs-North-West-London-Icb/salaries,ScraperAPI failed to fetch content,2025-12-10T19:20:58.289371
-Care Quality Commission - Talent - Monthly - Care Quality Commission,indeed,https://uk.indeed.com/cmp/Care-Quality-Commission/reviews,ScraperAPI failed to fetch content,2025-12-10T19:21:15.810915
-Chelsea FC Foundation (DX) Youth & Inclusion,indeed,https://uk.indeed.com/cmp/Chelsea-Football-Club/reviews?fcountry=GB&floc=Chelsea+FC,ScraperAPI failed to fetch content,2025-12-10T19:21:35.822464
-"Shell USA, Inc",indeed,https://uk.indeed.com/cmp/Shell/reviews,ScraperAPI failed to fetch content,2025-12-10T19:21:56.014862
-London Ambulance Service NHS Trust,indeed,https://uk.indeed.com/cmp/London-Ambulance-Services/reviews,ScraperAPI failed to fetch content,2025-12-10T19:22:14.852715
-Alliance Healthcare Management Services Limited,indeed,https://uk.indeed.com/cmp/Alliance-Healthcare-Management-Services-Ltd/reviews,ScraperAPI failed to fetch content,2025-12-10T19:22:31.313922
-Boots Digital Health Limited,indeed,https://uk.indeed.com/cmp/Boots-73b08684/reviews,ScraperAPI failed to fetch content,2025-12-10T19:22:50.387826
-Innovate UK - Weekly - Primary,indeed,https://uk.indeed.com/cmp/Innovate-Uk/reviews,ScraperAPI failed to fetch content,2025-12-10T19:23:10.408859
-OCS Group Holdings Limited,indeed,https://uk.indeed.com/cmp/Ocs-Group-347b003d/reviews,ScraperAPI failed to fetch content,2025-12-10T19:23:30.358100
-Shell Canada Ltd,indeed,https://uk.indeed.com/cmp/Shell/reviews,ScraperAPI failed to fetch content,2025-12-10T19:23:48.923707
-Sage Software Inc,indeed,https://uk.indeed.com/cmp/Sage/reviews,ScraperAPI failed to fetch content,2025-12-10T19:24:07.238142
-Shell Brands International AG,indeed,https://uk.indeed.com/cmp/Shell/reviews,ScraperAPI failed to fetch content,2025-12-10T19:24:25.674959
-Capgemini UK PLC - Central Government,indeed,https://uk.indeed.com/cmp/Capgemini/reviews,ScraperAPI failed to fetch content,2025-12-10T19:24:44.132032
-Cognizant Worldwide Limited - Primary,indeed,https://uk.indeed.com/cmp/Cognizant-Technology-Solutions/reviews,ScraperAPI failed to fetch content,2025-12-10T19:25:02.255628
-Nutricia Ltd,indeed,https://uk.indeed.com/cmp/Nutricia-Liverpool/reviews,ScraperAPI failed to fetch content,2025-12-10T19:25:19.258029
-UK Intellectual Property office,indeed,https://uk.indeed.com/cmp/Intellectual-Property-Office-1/reviews?fcountry=ALL,ScraperAPI failed to fetch content,2025-12-10T19:25:36.357304
-STONE TECHNOLOGIES LIMITED (TRADING AS REGD),indeed,https://uk.indeed.com/cmp/Stone-Technologies-Limited-1/reviews?fcountry=ALL,ScraperAPI failed to fetch content,2025-12-10T19:25:54.985552
-AH UK Holdco 1 LTD ,indeed,https://www.indeed.com/cmp/Indeed/reviews?fcountry=GB&ftext=company,ScraperAPI failed to fetch content,2025-12-10T19:26:14.738780
-Registers of Scotland,indeed,https://uk.indeed.com/cmp/Registers-of-Scotland/reviews,ScraperAPI failed to fetch content,2025-12-10T19:26:33.415005
-Manpower Group UK Limited ,indeed,https://uk.indeed.com/cmp/Manpowergroup/reviews,ScraperAPI failed to fetch content,2025-12-10T19:26:53.447703
-West Mercia Police,indeed,https://uk.indeed.com/cmp/West-Mercia-Police/reviews,ScraperAPI failed to fetch content,2025-12-10T19:27:11.958028
-Channel 3 Consulting Ltd,indeed,https://uk.indeed.com/cmp/Channel-3-Consulting,ScraperAPI failed to fetch content,2025-12-10T19:27:32.170003
-Caraffi Limited - N/A,indeed,https://uk.indeed.com/cmp/Indeed/reviews?ftext=working,ScraperAPI failed to fetch content,2025-12-10T19:27:52.795053
-Shell International Petroleum Company - SIPC (DX) ,indeed,https://uk.indeed.com/cmp/Shell/reviews,ScraperAPI failed to fetch content,2025-12-10T19:28:11.901226
-Gamma Telecom Ltd,indeed,https://uk.indeed.com/cmp/Gamma-Telecom/reviews,ScraperAPI failed to fetch content,2025-12-10T19:28:28.996723
-Pracyva,indeed,https://uk.indeed.com/cmp/Pracyva-Limited-6,ScraperAPI failed to fetch content,2025-12-10T19:28:49.532766
-Walgreens Boots Alliance Services Limited,indeed,https://uk.indeed.com/cmp/Walgreens-Boots-Alliance/reviews,ScraperAPI failed to fetch content,2025-12-10T19:29:06.532077
+STONE TECHNOLOGIES LIMITED (TRADING AS REGD),indeed,https://uk.indeed.com/cmp/Stone-Technologies-Limited-1/reviews?fcountry=ALL,Page not found (404) - URL may be invalid,2025-12-12T05:44:15.993042
+Channel 3 Consulting Ltd,indeed,https://uk.indeed.com/cmp/Channel-3-Consulting,No reviews found on page,2025-12-12T05:45:14.047316
+Pracyva,indeed,https://uk.indeed.com/cmp/Pracyva-Limited-6,No reviews found on page,2025-12-12T05:45:47.978412
