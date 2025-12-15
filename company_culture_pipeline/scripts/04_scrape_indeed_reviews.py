@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """
-Script to scrape employee reviews from multiple platforms
+Script to scrape employee reviews from Indeed platform only
 
 Features:
-- Multi-platform scraping: Indeed, Comparably, Kununu, AmbitionBox (excluding Glassdoor)
-- Multi-page scraping for Indeed (up to 5 pages per company) - OPTIMIZED FOR RATE LIMITS
-- Bypasses Cloudflare using ScraperAPI for Indeed
-- Uses Selenium for other platforms (Comparably, Kununu, AmbitionBox)
+- Indeed-only scraping
+- Multi-page scraping (up to 5 pages per company) - OPTIMIZED FOR RATE LIMITS
+- Bypasses Cloudflare using ScraperAPI
 - Extracts topic, text, and ratings
 - Handles pagination automatically
 - Uses ScraperAPI free tier (1,000 calls/month = 100 companies × 5 pages = 500 calls)
 - Smart rate limiting with 10-15s delays between pages
 - Exponential backoff on errors
 
-Input: reviews_link.json (with company_id, company_name, location, and platform URLs)
-Output: scraped_reviews.json (with company_id, company_name, location, url, platform, topic, text, rating)
-
-Platforms:
-- Indeed: Uses ScraperAPI (bypasses Cloudflare)
-- Comparably: Uses ScraperAPI (bypasses Cloudflare)
-- Kununu: Uses ScraperAPI (bypasses Cloudflare)
-- AmbitionBox: Uses ScraperAPI (bypasses Cloudflare)
-- Falls back to Selenium if ScraperAPI is not configured
+Input: reviews_link.json (with company_id, company_name, location, and indeed_url)
+Output: scraped_reviews_indeed.json (with company_id, company_name, location, url, platform, topic, text, rating)
 
 Rate Limiting Protection:
 - 5 pages per company (reduced from 10)
@@ -43,7 +35,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -60,9 +52,9 @@ load_dotenv()
 # Configuration
 INPUT_JSON = "data/raw_reviews/reviews_link.json"
 OUTPUT_DIR = "data/raw_reviews"
-REVIEWS_OUTPUT = f"{OUTPUT_DIR}/scraped_reviews.json"
-PROGRESS_FILE = f"{OUTPUT_DIR}/scraping_progress.json"
-FAILED_FILE = f"{OUTPUT_DIR}/failed_reviews.csv"
+REVIEWS_OUTPUT = f"{OUTPUT_DIR}/scraped_reviews_indeed.json"
+PROGRESS_FILE = f"{OUTPUT_DIR}/scraping_progress_indeed.json"
+FAILED_FILE = f"{OUTPUT_DIR}/failed_reviews_indeed.csv"
 
 # Scraping settings - OPTIMIZED TO AVOID RATE LIMITING
 MAX_REVIEWS_PER_COMPANY = 200  # Max reviews to scrape per company
@@ -203,7 +195,7 @@ class APIKeyManager:
 api_key_manager = APIKeyManager()
 SCRAPERAPI_KEY = api_key_manager.get_current_key() or ""
 USE_SCRAPERAPI = len(SCRAPERAPI_KEY) > 0
-SCRAPERAPI_PLATFORMS = ["indeed", "comparably", "kununu", "ambitionbox"]  # Use ScraperAPI for all platforms
+SCRAPERAPI_PLATFORMS = ["indeed"]  # Use ScraperAPI for Indeed only
 
 # User agents for rotation
 USER_AGENTS = [
@@ -362,6 +354,20 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=5, try_alterna
             # Don't retry 400s - they won't succeed
             return None
 
+        elif response.status_code == 401:
+            # 401 = Unauthorized = API key is invalid/malformed/doesn't exist
+            # This is different from 403 (credits exhausted) - the key itself is wrong
+            print(f"      ⚠️  ScraperAPI 401: API key is invalid or unauthorized")
+            print(f"      💡 Possible causes: Invalid key format, key deleted, or key doesn't exist")
+            
+            # Rotate to next API key (invalid key should be skipped)
+            if api_key_manager.rotate_key(reason="401_invalid_key") and retry < max_retries:
+                print(f"      🔄 Retrying with new API key...")
+                time.sleep(3)  # Brief pause before retry
+                return scrape_with_scraperapi(url, render, retry + 1, max_retries)
+            
+            return None
+
         elif response.status_code == 403:
             # 403 = Forbidden = API key credits exhausted
             # This is the ONLY case where we rotate to the next key
@@ -497,8 +503,8 @@ def parse_indeed_html(html, max_reviews=10):
 
         for idx, element in enumerate(review_elements[:max_reviews], 1):
             try:
-                # Extract topic/title - ONLY from actual title elements, NOT from text content
-                # Remove all "search-index" logic that extracts questions like "what is...", "can you..."
+                # Extract topic/title - Look in the review element AND its siblings/parent
+                # Indeed structure: Title is often in h3[data-testid="title"] as a sibling of review text
                 topic = None
                 
                 # Patterns that indicate this is NOT a valid title (questions, prompts, etc.)
@@ -527,8 +533,7 @@ def parse_indeed_html(html, max_reviews=10):
                         return False
                     return True
                 
-                # Strategy 1: Look for specific title selectors (data-testid, itemprop, etc.)
-                # These are the most reliable indicators of actual review titles
+                # Strategy 1: Look for title in the review element itself
                 primary_title_selectors = [
                     '[data-testid="review-title"]',
                     '[data-testid="title"]',
@@ -545,34 +550,165 @@ def parse_indeed_html(html, max_reviews=10):
                             topic = topic_text
                             break
                 
-                # Strategy 2: Look for heading elements with review-related classes
+                # Strategy 2: Look for title in parent container (title is often a sibling)
                 if not topic:
-                    heading_selectors = [
-                        'h2[class*="review"]',
-                        'h3[class*="review"]',
-                        'h2[class*="title"]',
-                        'h3[class*="title"]',
-                        '[class*="review-title"]',
-                        '[class*="ReviewTitle"]',
-                        '[class*="reviewTitle"]',
-                        '[data-tn-component*="reviewTitle"]',
-                    ]
-                    for selector in heading_selectors:
-                        topic_elem = element.select_one(selector)
-                        if topic_elem:
-                            topic_text = topic_elem.get_text(strip=True)
-                            if is_valid_title(topic_text) and len(topic_text.split()) < 20:
+                    parent = element.parent
+                    if parent:
+                        # Look for h3[data-testid="title"] in parent (common Indeed structure)
+                        title_elem = parent.select_one('h3[data-testid="title"]')
+                        if title_elem:
+                            topic_text = title_elem.get_text(strip=True)
+                            if is_valid_title(topic_text):
+                                topic = topic_text
+                        
+                        # Also check for other title selectors in parent
+                        if not topic:
+                            for selector in primary_title_selectors:
+                                title_elem = parent.select_one(selector)
+                                if title_elem:
+                                    topic_text = title_elem.get_text(strip=True)
+                                    if is_valid_title(topic_text):
+                                        topic = topic_text
+                                        break
+                        
+                        # Also check all children of parent for title elements (in case structure is nested)
+                        if not topic:
+                            all_title_elems = parent.find_all(['h2', 'h3', 'h4'], attrs={'data-testid': 'title'})
+                            if all_title_elems:
+                                # Use the first valid title found
+                                for title_elem in all_title_elems:
+                                    topic_text = title_elem.get_text(strip=True)
+                                    if is_valid_title(topic_text):
+                                        topic = topic_text
+                                        break
+                
+                # Strategy 3: Look for title in previous siblings (skip whitespace nodes)
+                if not topic:
+                    # Check previous siblings for title elements
+                    current = element.previous_sibling
+                    checked = 0
+                    while current and checked < 10:  # Increased limit
+                        # Skip NavigableString (whitespace) nodes
+                        if isinstance(current, NavigableString):
+                            current = current.previous_sibling if hasattr(current, 'previous_sibling') else None
+                            continue
+                        
+                        if hasattr(current, 'select_one'):
+                            # Check for h3[data-testid="title"] (most common Indeed structure)
+                            title_elem = current.select_one('h3[data-testid="title"]')
+                            if title_elem:
+                                topic_text = title_elem.get_text(strip=True)
+                                if is_valid_title(topic_text):
+                                    topic = topic_text
+                                    break
+                            
+                            # Also check if the sibling itself is a title element
+                            if hasattr(current, 'get'):
+                                if current.get('data-testid') == 'title':
+                                    topic_text = current.get_text(strip=True)
+                                    if is_valid_title(topic_text):
+                                        topic = topic_text
+                                        break
+                        
+                        # Also check all children of the sibling for title elements
+                        if hasattr(current, 'find_all'):
+                            title_children = current.find_all(['h2', 'h3', 'h4'], attrs={'data-testid': 'title'})
+                            if title_children:
+                                for title_child in title_children:
+                                    topic_text = title_child.get_text(strip=True)
+                                    if is_valid_title(topic_text):
+                                        topic = topic_text
+                                        break
+                                if topic:
+                                    break
+                        
+                        current = current.previous_sibling if hasattr(current, 'previous_sibling') else None
+                        checked += 1
+                
+                # Strategy 4: Look for heading elements with review-related classes in parent
+                if not topic:
+                    parent = element.parent
+                    if parent:
+                        heading_selectors = [
+                            'h2[class*="review"]',
+                            'h3[class*="review"]',
+                            'h2[class*="title"]',
+                            'h3[class*="title"]',
+                            '[class*="review-title"]',
+                            '[class*="ReviewTitle"]',
+                            '[class*="reviewTitle"]',
+                            '[data-tn-component*="reviewTitle"]',
+                        ]
+                        for selector in heading_selectors:
+                            topic_elem = parent.select_one(selector)
+                            if topic_elem:
+                                topic_text = topic_elem.get_text(strip=True)
+                                if is_valid_title(topic_text) and len(topic_text.split()) < 20:
+                                    topic = topic_text
+                                    break
+                
+                # Strategy 5: Look for heading elements (h2, h3) in parent but validate carefully
+                if not topic:
+                    parent = element.parent
+                    if parent:
+                        for heading_tag in ['h2', 'h3', 'h4']:
+                            heading_elem = parent.select_one(heading_tag)
+                            if heading_elem:
+                                topic_text = heading_elem.get_text(strip=True)
+                                # More strict: short headings only, not questions
+                                if is_valid_title(topic_text) and len(topic_text.split()) < 15:
+                                    topic = topic_text
+                                    break
+                
+                # Strategy 6: Search all ancestors (parent, grandparent, etc.) for title elements
+                if not topic:
+                    ancestor = element.parent
+                    levels_checked = 0
+                    while ancestor and levels_checked < 3:  # Check up to 3 levels up
+                        # Look for h3[data-testid="title"] in ancestor
+                        title_elem = ancestor.select_one('h3[data-testid="title"]')
+                        if title_elem:
+                            topic_text = title_elem.get_text(strip=True)
+                            if is_valid_title(topic_text):
                                 topic = topic_text
                                 break
+                        
+                        # Also check for any heading with data-testid="title"
+                        all_titles = ancestor.find_all(['h2', 'h3', 'h4'], attrs={'data-testid': 'title'})
+                        if all_titles:
+                            for title_elem in all_titles:
+                                topic_text = title_elem.get_text(strip=True)
+                                if is_valid_title(topic_text):
+                                    topic = topic_text
+                                    break
+                            if topic:
+                                break
+                        
+                        ancestor = ancestor.parent if hasattr(ancestor, 'parent') else None
+                        levels_checked += 1
                 
-                # Strategy 3: Look for heading elements (h2, h3) but validate carefully
+                # Strategy 7: Last resort - find the closest h3[data-testid="title"] anywhere in the document
+                # that appears before this review element (to avoid matching wrong titles)
                 if not topic:
-                    for heading_tag in ['h2', 'h3', 'h4']:
-                        heading_elem = element.select_one(heading_tag)
-                        if heading_elem:
-                            topic_text = heading_elem.get_text(strip=True)
-                            # More strict: short headings only, not questions
-                            if is_valid_title(topic_text) and len(topic_text.split()) < 15:
+                    # Get all title elements in the document
+                    all_title_elems = soup.find_all(['h2', 'h3', 'h4'], attrs={'data-testid': 'title'})
+                    # Find the one that's closest to our review element (check if it's in the same parent chain)
+                    for title_elem in all_title_elems:
+                        # Check if this title is in the same parent or ancestor chain
+                        title_parent = title_elem.parent
+                        review_parent = element.parent
+                        
+                        # Check if they share a common parent
+                        if title_parent == review_parent:
+                            topic_text = title_elem.get_text(strip=True)
+                            if is_valid_title(topic_text):
+                                topic = topic_text
+                                break
+                        
+                        # Check if title's parent contains our review element
+                        if title_parent and element in title_parent.descendants:
+                            topic_text = title_elem.get_text(strip=True)
+                            if is_valid_title(topic_text):
                                 topic = topic_text
                                 break
                 
@@ -895,554 +1031,10 @@ def scrape_indeed_reviews(driver, url, max_reviews=10):
     return reviews
 
 
-def parse_comparably_html(html, max_reviews=10):
-    """
-    Parse Comparably reviews from HTML
-    
-    IMPORTANT: Comparably format aggregates ALL review texts from one company into ONE JSON node.
-    Structure: Questions are in h2.section-subtitle, answers follow as siblings.
-    We collect all answers across all questions and combine them into one text field.
-    """
-    reviews = []
-    
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Comparably structure: Questions are in h2.section-subtitle elements
-        # Answers follow as siblings (divs, paragraphs, etc.)
-        question_headings = soup.select('h2.section-subtitle')
-        
-        if not question_headings:
-            print("      ⚠️  No review sections found in HTML")
-            return reviews
-        
-        print(f"      Found {len(question_headings)} review question sections")
-        
-        # Collect ALL review texts from all sections
-        all_review_texts = []
-        
-        for question_heading in question_headings:
-            question_text = question_heading.get_text(strip=True)
-            
-            # Skip if it's not a review question
-            if not question_text or len(question_text) < 10:
-                continue
-            
-            # Get all following siblings until the next h2.section-subtitle
-            current = question_heading.next_sibling
-            section_texts = []
-            
-            while current:
-                # Stop if we hit another section heading
-                if hasattr(current, 'name') and current.name == 'h2' and 'section-subtitle' in current.get('class', []):
-                    break
-                
-                # Extract text from this element
-                if hasattr(current, 'get_text'):
-                    text = current.get_text(strip=True)
-                    # Only collect meaningful text (not empty, not too short, not navigation)
-                    if text and len(text) > 10 and len(text) < 2000:
-                        # Filter out navigation/UI text and section headers
-                        skip_patterns = [
-                            'rate your company',
-                            'be the first to contribute',
-                            'there aren\'t any',
-                            'there are no',
-                            'search',
-                            'dashboard',
-                            'companies',
-                            'reviews',  # Filter out "Leadership Reviews", "Compensation Reviews" etc.
-                            'outlook reviews',
-                            'interview reviews',
-                        ]
-                        text_lower = text.lower().strip()
-                        # Skip if it's just a section header (ends with "Reviews" or is too short/pattern-like)
-                        if (text_lower.endswith('reviews') and len(text.split()) <= 3) or \
-                           any(pattern in text_lower for pattern in skip_patterns):
-                            continue
-                        section_texts.append(text)
-                
-                current = current.next_sibling
-        
-            # Add all texts from this section
-            if section_texts:
-                all_review_texts.extend(section_texts)
-                print(f"        ✓ Collected {len(section_texts)} answers from \"{question_text[:50]}...\"")
-        
-        # Combine all review texts into one text field
-        if all_review_texts:
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_texts = []
-            for text in all_review_texts:
-                text_lower = text.lower().strip()
-                if text_lower not in seen and len(text_lower) > 10:
-                    seen.add(text_lower)
-                    unique_texts.append(text)
-            
-            # Combine all texts with proper spacing
-            combined_text = ' '.join(unique_texts)
-            
-            # Clean up the combined text
-            combined_text = ' '.join(combined_text.split())  # Normalize whitespace
-            
-            # Extract rating if available (look for overall rating)
-            rating = None
-            rating_selectors = [
-                '[class*="rating"]',
-                '[class*="star"]',
-                '[data-rating]',
-                '[itemprop="ratingValue"]',
-            ]
-            for selector in rating_selectors:
-                rating_elem = soup.select_one(selector)
-                if rating_elem:
-                    try:
-                        rating_text = (
-                            rating_elem.get('content', '') or
-                            rating_elem.get('data-rating', '') or
-                            rating_elem.get_text()
-                        )
-                        rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                        if rating_match:
-                            rating = float(rating_match.group(1))
-                            # Normalize to 1-5 scale if needed
-                            if rating > 5:
-                                rating = rating / 2  # Convert 10-point to 5-point
-                            break
-                    except:
-                        pass
-            
-            # Create ONE review entry with ALL texts combined
-            if combined_text and len(combined_text) > 30:
-                reviews.append({
-                    "topic": None,  # Comparably doesn't have individual review titles
-                    "text": combined_text,  # All review sentences combined
-                    "rating": rating,
-                })
-                print(f"      ✓ Combined {len(unique_texts)} review texts into one entry ({len(combined_text)} chars)")
-        
-        if not reviews:
-            print("      ⚠️  No review content extracted")
-    
-    except Exception as e:
-        print(f"      ❌ HTML parsing error: {str(e)[:60]}")
-        import traceback
-        traceback.print_exc()
-    
-    return reviews
-
-
-def parse_kununu_html(html, max_reviews=10):
-    """Parse Kununu reviews from HTML"""
-    reviews = []
-    
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Kununu review selectors
-        review_selectors = [
-            '[class*="review"]',
-            '[class*="Review"]',
-            '[data-test*="review"]',
-            'article',
-            'div[itemtype*="Review"]',
-        ]
-        
-        review_elements = []
-        for selector in review_selectors:
-            review_elements = soup.select(selector)
-            if review_elements and len(review_elements) >= 1:
-                break
-        
-        if not review_elements:
-            print("      ⚠️  No review elements found in HTML")
-            return reviews
-        
-        print(f"      Found {len(review_elements)} review elements")
-        
-        for idx, element in enumerate(review_elements[:max_reviews], 1):
-            try:
-                # Extract topic/title - ONLY from actual title elements, NOT from text content
-                # Remove all "search-index" logic that extracts questions like "what is...", "can you..."
-                topic = None
-                
-                # Patterns that indicate this is NOT a valid title (questions, prompts, etc.)
-                invalid_patterns = [
-                    r'^what is',
-                    r'^what are',
-                    r'^how (is|are|do|does)',
-                    r'^tell us',
-                    r'^describe',
-                    r'^explain',
-                    r'^can you',
-                    r'^would you',
-                    r'^do you',
-                ]
-                
-                def is_valid_title(text):
-                    """Check if text is a valid title (not a question or prompt)"""
-                    if not text or len(text) < 3 or len(text) > 150:
-                        return False
-                    text_lower = text.lower().strip()
-                    # Don't accept questions
-                    if text.strip().endswith('?'):
-                        return False
-                    # Don't accept question patterns
-                    if any(re.search(pattern, text_lower) for pattern in invalid_patterns):
-                        return False
-                    return True
-                
-                # Strategy 1: Look for specific title selectors
-                topic_selectors = [
-                    '[itemprop="name"]',
-                    '[class*="review-title"]',
-                    '[class*="title"]',
-                    '[class*="heading"]',
-                    'h2',
-                    'h3',
-                    'h4',
-                    '[role="heading"]',
-                ]
-                for selector in topic_selectors:
-                    topic_elem = element.select_one(selector)
-                    if topic_elem:
-                        topic_text = topic_elem.get_text(strip=True)
-                        if is_valid_title(topic_text) and len(topic_text.split()) < 20:
-                            topic = topic_text
-                            break
-                
-                # DO NOT extract from text content, strong/bold text, or first lines
-                # These often contain questions like "what is...", "can you..." which are NOT titles
-                
-                # Extract review text
-                text = ""
-                text_selectors = [
-                    '[itemprop="reviewBody"]',
-                    '[class*="text"]',
-                    '[class*="content"]',
-                    '[class*="description"]',
-                    'p',
-                ]
-                for selector in text_selectors:
-                    text_elem = element.select_one(selector)
-                    if text_elem:
-                        text = text_elem.get_text(separator=' ', strip=True)
-                        if text and len(text) > 30:
-                            break
-                
-                if not text:
-                    text = element.get_text(separator=' ', strip=True)
-                
-                # Remove question patterns from text if present
-                if text:
-                    question_patterns = [
-                        r'^what is the best part',
-                        r'^what is the most stressful',
-                        r'^what is the work environment',
-                        r'^how (is|are|do|does)',
-                        r'^can you',
-                        r'^would you',
-                        r'^tell us',
-                    ]
-                    for pattern in question_patterns:
-                        text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
-                
-                # Extract rating
-                rating = None
-                rating_selectors = [
-                    '[itemprop="ratingValue"]',
-                    '[class*="rating"]',
-                    '[class*="star"]',
-                    '[data-rating]',
-                ]
-                for selector in rating_selectors:
-                    rating_elem = element.select_one(selector)
-                    if rating_elem:
-                        try:
-                            rating_text = (
-                                rating_elem.get('content', '') or
-                                rating_elem.get('data-rating', '') or
-                                rating_elem.get_text()
-                            )
-                            rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                            if rating_match:
-                                rating = float(rating_match.group(1))
-                                break
-                        except:
-                            pass
-                
-                if text and len(text) > 30:
-                    reviews.append({
-                        "topic": topic,
-                        "text": text,
-                        "rating": rating,
-                    })
-            
-            except Exception as e:
-                print(f"      ⚠️  Error parsing review {idx}: {str(e)[:40]}")
-                continue
-        
-        print(f"      ✓ Parsed {len(reviews)} reviews from HTML")
-    
-    except Exception as e:
-        print(f"      ❌ HTML parsing error: {str(e)[:60]}")
-    
-    return reviews
-
-
-def parse_ambitionbox_html(html, max_reviews=10):
-    """Parse AmbitionBox reviews from HTML"""
-    reviews = []
-    
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # AmbitionBox review selectors
-        review_selectors = [
-            '[class*="review"]',
-            '[class*="Review"]',
-            '[data-test*="review"]',
-            'article[class*="review"]',
-            'div[class*="review-card"]',
-        ]
-        
-        review_elements = []
-        for selector in review_selectors:
-            review_elements = soup.select(selector)
-            if review_elements and len(review_elements) >= 1:
-                break
-        
-        if not review_elements:
-            print("      ⚠️  No review elements found in HTML")
-            return reviews
-        
-        print(f"      Found {len(review_elements)} review elements")
-        
-        for idx, element in enumerate(review_elements[:max_reviews], 1):
-            try:
-                # Extract topic/title - ONLY from actual title elements, NOT from text content
-                # Remove all "search-index" logic that extracts questions like "what is...", "can you..."
-                topic = None
-                
-                # Patterns that indicate this is NOT a valid title (questions, prompts, etc.)
-                invalid_patterns = [
-                    r'^what is',
-                    r'^what are',
-                    r'^how (is|are|do|does)',
-                    r'^tell us',
-                    r'^describe',
-                    r'^explain',
-                    r'^can you',
-                    r'^would you',
-                    r'^do you',
-                ]
-                
-                def is_valid_title(text):
-                    """Check if text is a valid title (not a question or prompt)"""
-                    if not text or len(text) < 3 or len(text) > 150:
-                        return False
-                    text_lower = text.lower().strip()
-                    # Don't accept questions
-                    if text.strip().endswith('?'):
-                        return False
-                    # Don't accept question patterns
-                    if any(re.search(pattern, text_lower) for pattern in invalid_patterns):
-                        return False
-                    return True
-                
-                # Strategy 1: Look for specific title selectors
-                topic_selectors = [
-                    '[class*="review-title"]',
-                    '[class*="title"]',
-                    '[class*="heading"]',
-                    'h2',
-                    'h3',
-                    'h4',
-                    '[role="heading"]',
-                ]
-                for selector in topic_selectors:
-                    topic_elem = element.select_one(selector)
-                    if topic_elem:
-                        topic_text = topic_elem.get_text(strip=True)
-                        if is_valid_title(topic_text) and len(topic_text.split()) < 20:
-                            topic = topic_text
-                            break
-                
-                # DO NOT extract from text content, strong/bold text, or first lines
-                # These often contain questions like "what is...", "can you..." which are NOT titles
-                
-                # Extract review text
-                text = ""
-                text_selectors = [
-                    '[class*="text"]',
-                    '[class*="content"]',
-                    '[class*="description"]',
-                    '[class*="review-text"]',
-                    'p',
-                ]
-                for selector in text_selectors:
-                    text_elem = element.select_one(selector)
-                    if text_elem:
-                        text = text_elem.get_text(separator=' ', strip=True)
-                        if text and len(text) > 30:
-                            break
-                
-                if not text:
-                    text = element.get_text(separator=' ', strip=True)
-                
-                # Remove question patterns from text if present
-                if text:
-                    question_patterns = [
-                        r'^what is the best part',
-                        r'^what is the most stressful',
-                        r'^what is the work environment',
-                        r'^how (is|are|do|does)',
-                        r'^can you',
-                        r'^would you',
-                        r'^tell us',
-                    ]
-                    for pattern in question_patterns:
-                        text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
-                
-                # Extract rating
-                rating = None
-                rating_selectors = [
-                    '[class*="rating"]',
-                    '[class*="star"]',
-                    '[data-rating]',
-                    '[class*="score"]',
-                ]
-                for selector in rating_selectors:
-                    rating_elem = element.select_one(selector)
-                    if rating_elem:
-                        try:
-                            rating_text = (
-                                rating_elem.get('data-rating', '') or
-                                rating_elem.get('content', '') or
-                                rating_elem.get_text()
-                            )
-                            rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                            if rating_match:
-                                rating = float(rating_match.group(1))
-                                break
-                        except:
-                            pass
-                
-                if text and len(text) > 30:
-                    reviews.append({
-                        "topic": topic,
-                        "text": text,
-                        "rating": rating,
-                    })
-            
-            except Exception as e:
-                print(f"      ⚠️  Error parsing review {idx}: {str(e)[:40]}")
-                continue
-        
-        print(f"      ✓ Parsed {len(reviews)} reviews from HTML")
-    
-    except Exception as e:
-        print(f"      ❌ HTML parsing error: {str(e)[:60]}")
-    
-    return reviews
-
-
-def scrape_comparably_reviews(driver, url, max_reviews=10):
-    """Scrape reviews from Comparably"""
-    reviews = []
-
-    try:
-        driver.get(url)
-        time.sleep(SCROLL_DELAY * 3)
-
-        # Scroll to load content
-        for _ in range(3):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(SCROLL_DELAY)
-
-        # Generic review selectors
-        review_selectors = [
-            "[class*='review']",
-            "[class*='Review']",
-            "article",
-            "[class*='comment']",
-        ]
-
-        review_elements = []
-        for selector in review_selectors:
-            try:
-                review_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if len(review_elements) > 3:  # Need meaningful amount
-                    break
-            except:
-                continue
-
-        if not review_elements:
-            print("      ⚠️  No reviews found on page")
-            return reviews
-
-        print(f"      Found {len(review_elements[:max_reviews])} review elements")
-
-        for idx, element in enumerate(review_elements[:max_reviews], 1):
-            try:
-                review_text = element.text.strip()
-
-                if review_text and len(review_text) > 50:
-                    reviews.append(
-                        {
-                            "topic": None,
-                            "text": review_text,
-                            "rating": None,
-                        }
-                    )
-            except Exception as e:
-                continue
-
-        print(f"      ✓ Extracted {len(reviews)} reviews")
-
-    except Exception as e:
-        print(f"      ⚠️  Error: {str(e)[:60]}")
-
-    return reviews
-
-
-def scrape_generic_reviews(driver, url, platform_name, max_reviews=10):
-    """Generic scraper for other platforms"""
-    reviews = []
-
-    try:
-        driver.get(url)
-        time.sleep(SCROLL_DELAY * 3)
-
-        # Scroll to load content
-        for _ in range(2):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(SCROLL_DELAY)
-
-        # Get all text content
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-
-        if page_text and len(page_text) > 200:
-            reviews.append(
-                {
-                    "topic": None,
-                    "text": page_text[:5000],  # Limit to first 5000 chars
-                    "rating": None,
-                }
-            )
-            print(f"      ✓ Extracted page content ({len(page_text)} chars)")
-
-    except Exception as e:
-        print(f"      ⚠️  Error: {str(e)[:60]}")
-
-    return reviews
-
-
 def scrape_reviews_from_url(url, platform, max_reviews=10, company_name="unknown"):
     """
-    Scrape reviews from a URL
-    - Uses ScraperAPI for all platforms (Indeed, Comparably, Kununu, AmbitionBox) if available
+    Scrape reviews from an Indeed URL
+    - Uses ScraperAPI for Indeed if available
     - Falls back to Selenium if ScraperAPI is not configured
     - Includes fallback parser for difficult pages
 
@@ -1452,8 +1044,10 @@ def scrape_reviews_from_url(url, platform, max_reviews=10, company_name="unknown
         return [], False, "Empty URL"
 
     platform_lower = platform.lower()
+    if "indeed" not in platform_lower:
+        return [], False, f"Platform {platform} not supported (Indeed only)"
 
-    # Use ScraperAPI for all supported platforms if available
+    # Use ScraperAPI for Indeed if available
     if USE_SCRAPERAPI and platform_lower in SCRAPERAPI_PLATFORMS:
         print(f"      🔑 Using ScraperAPI for {platform}")
         try:
@@ -1466,20 +1060,12 @@ def scrape_reviews_from_url(url, platform, max_reviews=10, company_name="unknown
             if not html:
                 return [], False, "ScraperAPI failed to fetch content"
 
-            # Parse HTML based on platform
-            reviews = []
-            if "indeed" in platform_lower:
-                reviews = parse_indeed_html(html, max_reviews)
-                # Try fallback parser if primary parser found nothing
-                if not reviews:
-                    print(f"      🔄 Primary parser found no reviews, trying fallback parser...")
-                    reviews = parse_indeed_html_fallback(html, max_reviews, company_name)
-            elif "comparably" in platform_lower:
-                reviews = parse_comparably_html(html, max_reviews)
-            elif "kununu" in platform_lower:
-                reviews = parse_kununu_html(html, max_reviews)
-            elif "ambitionbox" in platform_lower or "ambition" in platform_lower:
-                reviews = parse_ambitionbox_html(html, max_reviews)
+            # Parse HTML for Indeed
+            reviews = parse_indeed_html(html, max_reviews)
+            # Try fallback parser if primary parser found nothing
+            if not reviews:
+                print(f"      🔄 Primary parser found no reviews, trying fallback parser...")
+                reviews = parse_indeed_html_fallback(html, max_reviews, company_name)
             
             if reviews:
                 return reviews, True, None
@@ -1530,23 +1116,15 @@ def scrape_reviews_from_url(url, platform, max_reviews=10, company_name="unknown
     # Fallback to Selenium if ScraperAPI is not configured
     else:
         if not USE_SCRAPERAPI:
-            print(f"      ⚠️  ScraperAPI not configured, using Selenium for {platform}")
+            print(f"      ⚠️  ScraperAPI not configured, using Selenium for Indeed")
 
-        print(f"      🌐 Using Selenium for {platform}")
+        print(f"      🌐 Using Selenium for Indeed")
         driver = init_browser()
         if not driver:
             return [], False, "Could not initialize browser"
 
         try:
-            if "comparably" in platform_lower:
-                reviews = scrape_comparably_reviews(driver, url, max_reviews)
-            elif "kununu" in platform_lower:
-                reviews = scrape_generic_reviews(driver, url, platform, max_reviews)
-            elif "ambitionbox" in platform_lower or "ambition" in platform_lower:
-                reviews = scrape_generic_reviews(driver, url, platform, max_reviews)
-            else:
-                reviews = scrape_generic_reviews(driver, url, platform, max_reviews)
-
+            reviews = scrape_indeed_reviews(driver, url, max_reviews)
             driver.quit()
 
             if reviews:
@@ -1606,7 +1184,7 @@ def save_failed_csv(failed_path, failed_items):
 
 def main():
     print("=" * 70)
-    print("EMPLOYEE REVIEW SCRAPER - Multi-Platform (Indeed, Comparably, Kununu, AmbitionBox)")
+    print("EMPLOYEE REVIEW SCRAPER - Indeed Platform Only")
     print("=" * 70)
     print()
 
@@ -1658,21 +1236,17 @@ def main():
     skipped_count = 0
     failed_items = []
 
-    # Review platforms to scrape - 4 platforms (excluding Glassdoor)
-    platforms_config = [
-        {"name": "indeed", "url_key": "indeed_url"},
-        {"name": "comparably", "url_key": "comparably_url"},
-        {"name": "kununu", "url_key": "kununu_url"},
-        {"name": "ambitionbox", "url_key": "ambition_url"}
-    ]
+    # Review platform to scrape - Indeed only
+    platform = "indeed"
+    url_key = "indeed_url"
 
     if USE_SCRAPERAPI:
-        print("✓ ScraperAPI enabled for all platforms")
-        print("✓ Scraping from: Indeed, Comparably, Kununu, AmbitionBox (all via ScraperAPI)")
+        print("✓ ScraperAPI enabled for Indeed")
+        print("✓ Scraping from: Indeed (via ScraperAPI)")
     else:
         print("⚠️  ScraperAPI not configured!")
         print("   Add SCRAPERAPI_KEY to .env to enable fast scraping with API")
-        print("   All platforms will fall back to Selenium (slower)")
+        print("   Will fall back to Selenium (slower)")
         print()
 
     for idx, company in enumerate(companies, 1):
@@ -1681,134 +1255,126 @@ def main():
         location = company.get("location", "")
         print(f"[{idx}/{len(companies)}] {company_name} (ID: {company_id})")
 
-        company_had_success = False
+        base_url = company.get(url_key, "")
 
-        for platform_config in platforms_config:
-            platform = platform_config["name"]
-            url_key = platform_config["url_key"]
-            base_url = company.get(url_key, "")
+        if not base_url or base_url.strip() == "":
+            print(f"   Indeed: No URL provided (skipped)")
+            continue
 
-            if not base_url or base_url.strip() == "":
-                continue
+        # Check if already scraped
+        scrape_key = f"{company_id}_{platform}"
+        if scrape_key in scraped_keys:
+            print(f"   Indeed: Already scraped (skipped)")
+            skipped_count += 1
+            continue
 
-            # Check if already scraped
-            scrape_key = f"{company_id}_{platform}"
-            if scrape_key in scraped_keys:
-                print(f"   {platform.capitalize()}: Already scraped (skipped)")
-                skipped_count += 1
-                continue
+        print(f"   Indeed: Scraping...")
 
-            print(f"   {platform.capitalize()}: Scraping...")
+        # Generate paginated URLs for Indeed
+        page_urls = generate_indeed_page_urls(base_url, MAX_PAGES_PER_COMPANY)
 
-            # Generate paginated URLs (only for Indeed)
-            if "indeed" in platform.lower():
-                page_urls = generate_indeed_page_urls(base_url, MAX_PAGES_PER_COMPANY)
-            else:
-                page_urls = [base_url]  # No pagination for other platforms
+        # Scrape multiple pages
+        platform_reviews = []
+        pages_scraped = 0
 
-            # Scrape multiple pages
-            platform_reviews = []
-            pages_scraped = 0
+        for page_num, url in enumerate(page_urls, 1):
+            # Stop if we have enough reviews
+            if len(platform_reviews) >= MAX_REVIEWS_PER_COMPANY:
+                print(f"      ✓ Reached {MAX_REVIEWS_PER_COMPANY} reviews limit")
+                break
 
-            for page_num, url in enumerate(page_urls, 1):
-                # Stop if we have enough reviews
-                if len(platform_reviews) >= MAX_REVIEWS_PER_COMPANY:
-                    print(f"      ✓ Reached {MAX_REVIEWS_PER_COMPANY} reviews limit")
-                    break
+            if page_num > 1:
+                print(f"      📄 Page {page_num}...")
 
-                if page_num > 1:
-                    print(f"      📄 Page {page_num}...")
+            # Scrape this page
+            reviews, success, error = scrape_reviews_from_url(
+                url, platform, MAX_REVIEWS_PER_COMPANY - len(platform_reviews), company_name
+            )
 
-                # Scrape this page
-                reviews, success, error = scrape_reviews_from_url(
-                    url, platform, MAX_REVIEWS_PER_COMPANY - len(platform_reviews), company_name
-                )
-
-                if success and reviews:
-                    platform_reviews.extend(reviews)
-                    pages_scraped += 1
-                    print(
-                        f"      ✓ Page {page_num}: Got {len(reviews)} reviews (Total: {len(platform_reviews)})"
-                    )
-                elif page_num == 1:
-                    # If first page fails, record as failed (unless it's expected 404)
-                    if error and "No more pages (404)" in error:
-                        # First page 404 means URL is invalid
-                        failed_count += 1
-                        failed_items.append(
-                            {
-                                "company_name": company_name,
-                                "platform": platform,
-                                "url": url,
-                                "error": "Page not found (404) - URL may be invalid",
-                                "timestamp": datetime.now().isoformat(),
-                            }
-                        )
-                    else:
-                        failed_count += 1
-                        failed_items.append(
-                            {
-                                "company_name": company_name,
-                                "platform": platform,
-                                "url": url,
-                                "error": error or "Unknown error",
-                                "timestamp": datetime.now().isoformat(),
-                            }
-                        )
-                    save_failed_csv(Path(FAILED_FILE), failed_items)
-                    break
-                else:
-                    # No more reviews on this page, stop pagination
-                    # Check if it's an expected 404 (no more pages) or other error
-                    if error and "No more pages (404)" in error:
-                        print(f"      ✓ No more pages (404), stopping pagination")
-                    else:
-                        print(f"      ✓ No more reviews on page {page_num}, stopping")
-                    break
-
-                # Delay between page requests to avoid rate limiting
-                if page_num < len(page_urls):
-                    delay = random.uniform(*DELAY_BETWEEN_PAGES)
-                    print(f"      ⏳ Waiting {delay:.1f}s before next page...")
-                    time.sleep(delay)
-
-            # Save all reviews from this platform
-            if platform_reviews:
-                # Add company context to each review with required fields
-                for review in platform_reviews:
-                    # Ensure all required fields are present
-                    review["company_id"] = company_id
-                    review["company_name"] = company_name
-                    review["location"] = location
-                    review["url"] = base_url  # Use base URL
-                    review["platform"] = platform
-                    # Ensure topic, text, rating exist (may be None)
-                    if "topic" not in review:
-                        review["topic"] = None
-                    if "text" not in review:
-                        review["text"] = review.get("review_text", "")
-                    if "rating" not in review:
-                        review["rating"] = None
-                    # Remove any extra fields not in the required list
-                    allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating"]
-                    review_copy = {k: v for k, v in review.items() if k in allowed_fields}
-                    review.clear()
-                    review.update(review_copy)
-
-                all_reviews.extend(platform_reviews)
-                success_count += 1
-                company_had_success = True
-
-                # Save after each platform
-                save_data(REVIEWS_OUTPUT, all_reviews)
+            if success and reviews:
+                platform_reviews.extend(reviews)
+                pages_scraped += 1
                 print(
-                    f"      💾 Saved {len(platform_reviews)} total reviews from {pages_scraped} pages"
+                    f"      ✓ Page {page_num}: Got {len(reviews)} reviews (Total: {len(platform_reviews)})"
                 )
+            elif page_num == 1:
+                # If first page fails, record as failed (unless it's expected 404)
+                if error and "No more pages (404)" in error:
+                    # First page 404 means URL is invalid
+                    failed_count += 1
+                    failed_items.append(
+                        {
+                            "company_name": company_name,
+                            "platform": platform,
+                            "url": url,
+                            "error": "Page not found (404) - URL may be invalid",
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                else:
+                    failed_count += 1
+                    failed_items.append(
+                        {
+                            "company_name": company_name,
+                            "platform": platform,
+                            "url": url,
+                            "error": error or "Unknown error",
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                save_failed_csv(Path(FAILED_FILE), failed_items)
+                break
+            else:
+                # No more reviews on this page, stop pagination
+                # Check if it's an expected 404 (no more pages) or other error
+                if error and "No more pages (404)" in error:
+                    print(f"      ✓ No more pages (404), stopping pagination")
+                else:
+                    print(f"      ✓ No more reviews on page {page_num}, stopping")
+                break
 
-            # Delay between platforms/companies to avoid rate limiting
-            delay = random.uniform(*DELAY_BETWEEN_PLATFORMS)
-            print(f"   ⏳ Waiting {delay:.1f}s before next platform...")
-            time.sleep(delay)
+            # Delay between page requests to avoid rate limiting
+            if page_num < len(page_urls):
+                delay = random.uniform(*DELAY_BETWEEN_PAGES)
+                print(f"      ⏳ Waiting {delay:.1f}s before next page...")
+                time.sleep(delay)
+
+        # Save all reviews from this platform
+        if platform_reviews:
+            # Add company context to each review with required fields
+            for review in platform_reviews:
+                # Ensure all required fields are present
+                review["company_id"] = company_id
+                review["company_name"] = company_name
+                review["location"] = location
+                review["url"] = base_url  # Use base URL
+                review["platform"] = platform
+                # Ensure topic, text, rating exist (may be None)
+                if "topic" not in review:
+                    review["topic"] = None
+                if "text" not in review:
+                    review["text"] = review.get("review_text", "")
+                if "rating" not in review:
+                    review["rating"] = None
+                # Remove any extra fields not in the required list
+                allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating"]
+                review_copy = {k: v for k, v in review.items() if k in allowed_fields}
+                review.clear()
+                review.update(review_copy)
+
+            all_reviews.extend(platform_reviews)
+            success_count += 1
+
+            # Save after scraping
+            save_data(REVIEWS_OUTPUT, all_reviews)
+            print(
+                f"      💾 Saved {len(platform_reviews)} total reviews from {pages_scraped} pages"
+            )
+
+        # Delay between companies to avoid rate limiting
+        delay = random.uniform(*DELAY_BETWEEN_PLATFORMS)
+        print(f"   ⏳ Waiting {delay:.1f}s before next company...")
+        time.sleep(delay)
 
         print()
 
