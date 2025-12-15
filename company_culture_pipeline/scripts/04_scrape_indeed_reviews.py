@@ -466,40 +466,32 @@ def clean_review_text(text):
 
 def parse_indeed_html(html, max_reviews=10):
     reviews = []
+    seen_texts = set()  # Track duplicates by normalized text signature
 
     try:
         soup = BeautifulSoup(html, "html.parser")
 
-        # Try multiple selectors for Indeed reviews (Updated 2024/2025)
-        review_selectors = [
-            # Modern Indeed selectors (2024/2025)
-            '[data-testid="review-card"]',
-            '[data-testid="review"]',
-            '[id*="cmp-review-"]',
-            'div[class*="css-"][id*="review"]',  # Indeed uses CSS-in-JS
-            
-            # Legacy selectors (fallback)
-            '[data-tn-component="reviews"]',
-            '[class*="review-item"]',
-            '[class*="ReviewItem"]',
-            'div[itemprop="review"]',
-            '[class*="review"]',
-        ]
-
-        review_elements = []
-        matched_selector = None
-        for selector in review_selectors:
-            review_elements = soup.select(selector)
-            # FIXED: Accept ANY reviews found (not just >3)
-            if review_elements and len(review_elements) >= 1:
-                matched_selector = selector
-                break
+        # Use the most specific selector from indeed.html structure
+        # Reviews are in: <div data-testid="reviews[]" itemprop="review" itemscope itemtype="http://schema.org/Review">
+        review_elements = soup.select('div[data-testid="reviews[]"][itemprop="review"]')
+        
+        # Fallback to other selectors if primary doesn't work
+        if not review_elements:
+            review_selectors = [
+                'div[itemprop="review"][itemtype="http://schema.org/Review"]',
+                '[data-testid="review-card"]',
+                '[data-testid="review"]',
+            ]
+            for selector in review_selectors:
+                review_elements = soup.select(selector)
+                if review_elements:
+                    break
 
         if not review_elements:
             print("      ⚠️  No review elements found in HTML")
             return reviews
 
-        print(f"      Found {len(review_elements)} review elements (using selector: {matched_selector[:40]}...)")
+        print(f"      Found {len(review_elements)} review elements")
 
         for idx, element in enumerate(review_elements[:max_reviews], 1):
             try:
@@ -757,9 +749,9 @@ def parse_indeed_html(html, max_reviews=10):
                             if text and len(text) > 20:
                                 break
 
-                # Strategy 3: Fallback to all text in element, but exclude title elements
+                # Strategy 3: Fallback to all text in element, but exclude title and date elements
                 if not text:
-                    # Get all text but exclude elements that might be titles
+                    # Get all text but exclude elements that might be titles or dates
                     all_elements = element.find_all(['p', 'span', 'div', 'li'])
                     text_parts = []
                     for elem in all_elements:
@@ -769,7 +761,28 @@ def parse_indeed_html(html, max_reviews=10):
                             if elem.select_one(title_selector):
                                 is_title = True
                                 break
-                        if not is_title:
+                        
+                        # Skip if it's a date element (span with date classes)
+                        is_date = False
+                        if hasattr(elem, 'get'):
+                            classes = elem.get('class', [])
+                            if classes and 'css-18clrlu' in ' '.join(classes) and 'e1wnkr790' in ' '.join(classes):
+                                is_date = True
+                            # Also check if it's a meta date tag
+                            if elem.name == 'meta' and elem.get('itemprop') == 'datePublished':
+                                is_date = True
+                        
+                        # Also check if text looks like a date (contains month name and year)
+                        if not is_date:
+                            elem_text = elem.get_text(strip=True)
+                            if elem_text:
+                                months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+                                if any(month in elem_text for month in months) and any(char.isdigit() for char in elem_text):
+                                    # Check if it's a short text that looks like a date (not a long review text that happens to mention a month)
+                                    if len(elem_text) < 50:  # Dates are typically short
+                                        is_date = True
+                        
+                        if not is_title and not is_date:
                             elem_text = elem.get_text(strip=True)
                             if elem_text and len(elem_text) > 10:
                                 text_parts.append(elem_text)
@@ -777,7 +790,12 @@ def parse_indeed_html(html, max_reviews=10):
                     if text_parts:
                         text = ' '.join(text_parts)
                     else:
-                        text = element.get_text(separator=' ', strip=True)
+                        # Get all text but remove date spans
+                        all_text = element.get_text(separator=' ', strip=True)
+                        # Remove date patterns from text
+                        # Pattern to match dates like "March 18, 2025"
+                        date_pattern = r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b'
+                        text = re.sub(date_pattern, '', all_text).strip()
                 
                 # POST-PROCESSING: Clean up text and remove question patterns
                 if text:
@@ -818,13 +836,149 @@ def parse_indeed_html(html, max_reviews=10):
                         except:
                             pass
 
-                # FIXED: Reduced minimum text length from 50 to 20
+                # Extract date - look for the specific Indeed date span
+                # Date is in: <span class="css-18clrlu e1wnkr790">August 13, 2024</span>
+                # Or in meta: <meta itemprop="datePublished" content="August 13, 2024">
+                date = None
+                
+                # Helper function to validate date text
+                def is_valid_date_text(text):
+                    """Check if text looks like a date (Month Day, Year format)"""
+                    if not text or len(text) < 8:  # Minimum length for a date
+                        return False
+                    months = ['January', 'February', 'March', 'April', 'May', 'June', 
+                             'July', 'August', 'September', 'October', 'November', 'December']
+                    text_lower = text.lower()
+                    # Must contain a month name and digits (year)
+                    has_month = any(month.lower() in text_lower for month in months)
+                    has_digits = any(char.isdigit() for char in text)
+                    # Check for date pattern: "Month Day, Year" or "Month Day Year"
+                    has_comma = ',' in text
+                    return has_month and has_digits and (has_comma or len(text.split()) >= 3)
+                
+                # Strategy 1: Look for meta tag with itemprop="datePublished" (most reliable)
+                meta_date = element.select_one('meta[itemprop="datePublished"]')
+                if meta_date:
+                    date_text = meta_date.get("content", "").strip()
+                    if is_valid_date_text(date_text):
+                        date = date_text
+                
+                # Strategy 2: Look for the specific date span with both classes css-18clrlu and e1wnkr790
+                if not date:
+                    # Method 1: Use CSS selector for exact class match
+                    date_spans = element.select('span.css-18clrlu.e1wnkr790')
+                    if not date_spans:
+                        # Method 2: Find spans and check classes manually (handles class as list or string)
+                        all_spans = element.find_all('span')
+                        for span in all_spans:
+                            classes = span.get('class', [])
+                            # Handle both list and string formats
+                            if isinstance(classes, list):
+                                class_str = ' '.join(classes)
+                            else:
+                                class_str = str(classes) if classes else ''
+                            # Check if both required classes are present
+                            if 'css-18clrlu' in class_str and 'e1wnkr790' in class_str:
+                                date_spans.append(span)
+                    
+                    # Extract date from found spans
+                    for span in date_spans:
+                        date_text = span.get_text(strip=True)
+                        if is_valid_date_text(date_text):
+                            date = date_text
+                            break
+                
+                # Strategy 3: Look in parent container (date is often in the same parent as rating)
+                if not date:
+                    parent = element.parent
+                    if parent:
+                        # Check meta tag in parent
+                        meta_date = parent.select_one('meta[itemprop="datePublished"]')
+                        if meta_date:
+                            date_text = meta_date.get("content", "").strip()
+                            if is_valid_date_text(date_text):
+                                date = date_text
+                        
+                        # Check for date span in parent
+                        if not date:
+                            date_spans = parent.select('span.css-18clrlu.e1wnkr790')
+                            if not date_spans:
+                                all_spans = parent.find_all('span')
+                                for span in all_spans:
+                                    classes = span.get('class', [])
+                                    if isinstance(classes, list):
+                                        class_str = ' '.join(classes)
+                                    else:
+                                        class_str = str(classes) if classes else ''
+                                    if 'css-18clrlu' in class_str and 'e1wnkr790' in class_str:
+                                        date_spans.append(span)
+                            
+                            for span in date_spans:
+                                date_text = span.get_text(strip=True)
+                                if is_valid_date_text(date_text):
+                                    date = date_text
+                                    break
+                
+                # Strategy 4: Look in ancestor containers (up to 3 levels)
+                if not date:
+                    ancestor = element.parent
+                    levels_checked = 0
+                    while ancestor and levels_checked < 3:
+                        # Check meta tag
+                        meta_date = ancestor.select_one('meta[itemprop="datePublished"]')
+                        if meta_date:
+                            date_text = meta_date.get("content", "").strip()
+                            if is_valid_date_text(date_text):
+                                date = date_text
+                                if date:
+                                    break
+                        
+                        # Check for date span
+                        if not date:
+                            date_spans = ancestor.select('span.css-18clrlu.e1wnkr790')
+                            if not date_spans:
+                                all_spans = ancestor.find_all('span')
+                                for span in all_spans:
+                                    classes = span.get('class', [])
+                                    if isinstance(classes, list):
+                                        class_str = ' '.join(classes)
+                                    else:
+                                        class_str = str(classes) if classes else ''
+                                    if 'css-18clrlu' in class_str and 'e1wnkr790' in class_str:
+                                        date_spans.append(span)
+                            
+                            for span in date_spans:
+                                date_text = span.get_text(strip=True)
+                                if is_valid_date_text(date_text):
+                                    date = date_text
+                                    break
+                            if date:
+                                break
+                        
+                        ancestor = ancestor.parent if hasattr(ancestor, 'parent') else None
+                        levels_checked += 1
+
+                # Only add reviews that have a date (required)
+                if not date:
+                    continue
+                
+                # Check for duplicates using normalized text signature
+                text_normalized = ' '.join(text.lower().split())
+                text_signature = text_normalized[:200]  # Use first 200 chars as signature
+                
+                if text_signature in seen_texts:
+                    continue  # Skip duplicate
+                
+                seen_texts.add(text_signature)
+                
+                # Minimum text length check
                 if text and len(text) > 20:
                     reviews.append(
                         {
                             "topic": topic or None,
                             "text": text,
                             "rating": rating,
+                            "date": date,
                         }
                     )
 
@@ -890,6 +1044,27 @@ def parse_indeed_html_fallback(html, max_reviews=10, company_name="unknown"):
                         
                         seen_texts.add(text_signature)
                         
+                        # Extract date from container
+                        date = None
+                        date_selectors = [
+                            'span.css-18clrlu.e1wnkr790',  # Specific Indeed date selector
+                            'span[class*="css-18clrlu"]',  # Partial class match
+                            'span[class*="e1wnkr790"]',  # Partial class match
+                            '[itemprop="datePublished"]',
+                            '[data-testid="review-date"]',
+                            '[class*="review-date"]',
+                            '[class*="date"]',
+                        ]
+                        for selector in date_selectors:
+                            date_elem = container.select_one(selector)
+                            if date_elem:
+                                date_text = date_elem.get_text(strip=True)
+                                if not date_text:
+                                    date_text = date_elem.get("content", "") or date_elem.get("datetime", "")
+                                if date_text:
+                                    date = date_text
+                                    break
+                        
                         # Clean the text to remove "Show more..." artifacts
                         cleaned_text = clean_review_text(text)
                         
@@ -897,6 +1072,7 @@ def parse_indeed_html_fallback(html, max_reviews=10, company_name="unknown"):
                             "topic": topic,
                             "text": cleaned_text,
                             "rating": None,
+                            "date": date,
                         })
                         
                         if len(reviews) >= max_reviews:
@@ -1007,12 +1183,60 @@ def scrape_indeed_reviews(driver, url, max_reviews=10):
                 except:
                     pass
 
+                # Extract date - look for the specific Indeed date span
+                date = None
+                months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+                
+                # Strategy 1: Look for meta tag with itemprop="datePublished" (most reliable)
+                try:
+                    meta_date = element.find_element(By.CSS_SELECTOR, "meta[itemprop='datePublished']")
+                    date = meta_date.get_attribute("content")
+                    if date:
+                        date = date.strip()
+                except:
+                    pass
+                
+                # Strategy 2: Look for the specific date span with both classes
+                if not date:
+                    try:
+                        # Find span with both classes css-18clrlu and e1wnkr790
+                        date_elem = element.find_element(By.CSS_SELECTOR, "span.css-18clrlu.e1wnkr790")
+                        date = date_elem.text.strip()
+                        # Validate it looks like a date
+                        if date and not (any(month in date for month in months) and any(char.isdigit() for char in date)):
+                            date = None
+                    except:
+                        pass
+                
+                # Strategy 3: Try parent element if date not found
+                if not date:
+                    try:
+                        parent = element.find_element(By.XPATH, "..")
+                        meta_date = parent.find_element(By.CSS_SELECTOR, "meta[itemprop='datePublished']")
+                        date = meta_date.get_attribute("content")
+                        if date:
+                            date = date.strip()
+                    except:
+                        pass
+                    
+                    if not date:
+                        try:
+                            parent = element.find_element(By.XPATH, "..")
+                            date_elem = parent.find_element(By.CSS_SELECTOR, "span.css-18clrlu.e1wnkr790")
+                            date = date_elem.text.strip()
+                            # Validate it looks like a date
+                            if date and not (any(month in date for month in months) and any(char.isdigit() for char in date)):
+                                date = None
+                        except:
+                            pass
+
                 if review_text and len(review_text) > 50:
                     reviews.append(
                         {
                             "topic": topic or None,
                             "text": review_text,
                             "rating": rating,
+                            "date": date,
                             "platform": "indeed",
                             "scraped_at": datetime.now().isoformat(),
                         }
@@ -1148,19 +1372,157 @@ def load_existing_data(output_path):
                 # Get set of already scraped company-platform combinations
                 # Use company_id if available, otherwise fallback to company_name
                 scraped_keys = set()
+                # Map company_id -> list of reviews (to check for missing dates)
+                reviews_by_company = {}
                 for item in data:
                     company_id = item.get("company_id")
                     company_name = item.get("company_name", "Unknown")
                     platform = item.get("platform", "unknown")
                     if company_id:
-                        scraped_keys.add(f"{company_id}_{platform}")
+                        key = f"{company_id}_{platform}"
+                        scraped_keys.add(key)
+                        if key not in reviews_by_company:
+                            reviews_by_company[key] = []
+                        reviews_by_company[key].append(item)
                     else:
-                        scraped_keys.add(f"{company_name}_{platform}")
-                return data, scraped_keys
+                        key = f"{company_name}_{platform}"
+                        scraped_keys.add(key)
+                        if key not in reviews_by_company:
+                            reviews_by_company[key] = []
+                        reviews_by_company[key].append(item)
+                return data, scraped_keys, reviews_by_company
         except Exception as e:
             print(f"⚠️  Could not load existing data: {e}")
-            return [], set()
-    return [], set()
+            return [], set(), {}
+    return [], set(), {}
+
+
+def has_missing_dates(reviews):
+    """Check if any reviews in the list are missing the date field"""
+    if not reviews:
+        return True
+    for review in reviews:
+        if "date" not in review or review.get("date") is None:
+            return True
+    return False
+
+
+def merge_reviews_with_dates(existing_reviews, new_reviews, company_id, platform):
+    """
+    Merge new reviews with existing reviews, matching by text and updating dates.
+    Uses multiple matching strategies for robustness.
+    Returns updated list of reviews with dates added to existing ones.
+    """
+    # Filter existing reviews for this company/platform
+    existing_for_company = [
+        r for r in existing_reviews
+        if r.get("company_id") == company_id and r.get("platform") == platform
+    ]
+    
+    if not existing_for_company:
+        return 0
+    
+    # Create multiple signature maps for flexible matching
+    # Strategy 1: First 100 chars (exact match)
+    existing_map_100 = {}
+    # Strategy 2: First 200 chars (more robust)
+    existing_map_200 = {}
+    # Strategy 3: Normalized text (remove extra whitespace, lowercased)
+    existing_map_normalized = {}
+    
+    for review in existing_for_company:
+        text = review.get("text", "")
+        if not text:
+            continue
+        
+        # Normalize text for matching
+        normalized = ' '.join(text.lower().split())
+        
+        # Strategy 1: First 100 chars
+        sig_100 = normalized[:100]
+        if sig_100 and sig_100 not in existing_map_100:
+            existing_map_100[sig_100] = review
+        
+        # Strategy 2: First 200 chars
+        sig_200 = normalized[:200]
+        if sig_200 and sig_200 not in existing_map_200:
+            existing_map_200[sig_200] = review
+        
+        # Strategy 3: Full normalized text (for short reviews)
+        if len(normalized) < 150:
+            if normalized not in existing_map_normalized:
+                existing_map_normalized[normalized] = review
+    
+    # Update existing reviews with dates from new reviews
+    updated_count = 0
+    matched_signatures = set()  # Track which existing reviews were matched
+    
+    for new_review in new_reviews:
+        text = new_review.get("text", "")
+        if not text or not new_review.get("date"):
+            continue
+        
+        # Normalize new review text
+        normalized = ' '.join(text.lower().split())
+        
+        # Try matching strategies in order of preference
+        matched_review = None
+        
+        # Strategy 1: Try first 200 chars (most robust)
+        sig_200 = normalized[:200]
+        if sig_200 and sig_200 in existing_map_200:
+            matched_review = existing_map_200[sig_200]
+            matched_signatures.add(sig_200)
+        
+        # Strategy 2: Try first 100 chars
+        elif len(normalized) >= 100:
+            sig_100 = normalized[:100]
+            if sig_100 in existing_map_100:
+                matched_review = existing_map_100[sig_100]
+                matched_signatures.add(sig_100)
+        
+        # Strategy 3: For short reviews, try full normalized text
+        if not matched_review and len(normalized) < 150:
+            if normalized in existing_map_normalized:
+                matched_review = existing_map_normalized[normalized]
+                matched_signatures.add(normalized)
+        
+        # Strategy 4: Fuzzy match - check if new text contains significant portion of existing text
+        if not matched_review:
+            for existing_review in existing_for_company:
+                existing_text = existing_review.get("text", "")
+                if not existing_text:
+                    continue
+                
+                existing_normalized = ' '.join(existing_text.lower().split())
+                
+                # Check if texts are similar (one contains significant portion of the other)
+                # Use at least 80% overlap for short texts, or 100+ char overlap for longer texts
+                min_len = min(len(normalized), len(existing_normalized))
+                if min_len < 100:
+                    # For short texts, require 80% overlap
+                    if min_len > 0:
+                        # Find longest common substring
+                        overlap = 0
+                        for i in range(min_len):
+                            if normalized[i:i+min(50, min_len-i)] in existing_normalized:
+                                overlap = max(overlap, min(50, min_len-i))
+                        if overlap >= min_len * 0.8:
+                            matched_review = existing_review
+                            break
+                else:
+                    # For longer texts, check if first 100 chars match or significant overlap
+                    if normalized[:100] in existing_normalized or existing_normalized[:100] in normalized:
+                        matched_review = existing_review
+                        break
+        
+        # Update date if match found and date is missing
+        if matched_review:
+            if ("date" not in matched_review or matched_review.get("date") is None):
+                matched_review["date"] = new_review.get("date")
+                updated_count += 1
+    
+    return updated_count
 
 
 def save_data(output_path, all_data):
@@ -1213,11 +1575,18 @@ def main():
         print("⚠️  ScraperAPI not configured - Indeed scraping will be limited")
 
     # Load existing data
-    all_reviews, scraped_keys = load_existing_data(REVIEWS_OUTPUT)
+    all_reviews, scraped_keys, reviews_by_company = load_existing_data(REVIEWS_OUTPUT)
     if scraped_keys:
         print(
             f"✓ Found {len(scraped_keys)} already scraped company-platform combinations"
         )
+        # Check how many have missing dates
+        missing_dates_count = 0
+        for key in scraped_keys:
+            if key in reviews_by_company and has_missing_dates(reviews_by_company[key]):
+                missing_dates_count += 1
+        if missing_dates_count > 0:
+            print(f"   📅 {missing_dates_count} company(ies) have reviews missing date field - will re-scrape to add dates")
 
     print("✓ Using undetected-chromedriver (bypasses Cloudflare)")
     print(f"✓ Max reviews per company: {MAX_REVIEWS_PER_COMPANY}")
@@ -1263,12 +1632,19 @@ def main():
 
         # Check if already scraped
         scrape_key = f"{company_id}_{platform}"
+        needs_rescrape = False
         if scrape_key in scraped_keys:
-            print(f"   Indeed: Already scraped (skipped)")
-            skipped_count += 1
-            continue
-
-        print(f"   Indeed: Scraping...")
+            # Check if reviews are missing dates
+            existing_reviews = reviews_by_company.get(scrape_key, [])
+            if has_missing_dates(existing_reviews):
+                print(f"   Indeed: Already scraped but missing dates - re-scraping to add dates...")
+                needs_rescrape = True
+            else:
+                print(f"   Indeed: Already scraped with dates (skipped)")
+                skipped_count += 1
+                continue
+        else:
+            print(f"   Indeed: Scraping...")
 
         # Generate paginated URLs for Indeed
         page_urls = generate_indeed_page_urls(base_url, MAX_PAGES_PER_COMPANY)
@@ -1341,6 +1717,43 @@ def main():
 
         # Save all reviews from this platform
         if platform_reviews:
+            # Remove duplicates before adding company context
+            # Use text signature to identify duplicates
+            unique_reviews = []
+            seen_signatures = set()
+            
+            for review in platform_reviews:
+                # Only keep reviews with dates
+                if not review.get("date"):
+                    continue
+                
+                # Create signature from normalized text
+                text = review.get("text", "")
+                if not text:
+                    continue
+                
+                text_normalized = ' '.join(text.lower().split())
+                text_signature = text_normalized[:200]  # First 200 chars as signature
+                
+                # Skip if we've seen this text before
+                if text_signature in seen_signatures:
+                    continue
+                
+                seen_signatures.add(text_signature)
+                unique_reviews.append(review)
+            
+            duplicates_removed = len(platform_reviews) - len(unique_reviews)
+            if duplicates_removed > 0:
+                print(f"      🔍 Removed {duplicates_removed} duplicate(s) (kept {len(unique_reviews)} unique reviews with dates)")
+            
+            platform_reviews = unique_reviews
+            
+            if not platform_reviews:
+                print(f"      ⚠️  No unique reviews with dates found after deduplication")
+                if needs_rescrape:
+                    save_data(REVIEWS_OUTPUT, all_reviews)
+                continue
+            
             # Add company context to each review with required fields
             for review in platform_reviews:
                 # Ensure all required fields are present
@@ -1349,27 +1762,58 @@ def main():
                 review["location"] = location
                 review["url"] = base_url  # Use base URL
                 review["platform"] = platform
-                # Ensure topic, text, rating exist (may be None)
+                # Ensure topic, text, rating, date exist (may be None)
                 if "topic" not in review:
                     review["topic"] = None
                 if "text" not in review:
                     review["text"] = review.get("review_text", "")
                 if "rating" not in review:
                     review["rating"] = None
+                if "date" not in review:
+                    review["date"] = None
                 # Remove any extra fields not in the required list
-                allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating"]
+                allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating", "date"]
                 review_copy = {k: v for k, v in review.items() if k in allowed_fields}
                 review.clear()
                 review.update(review_copy)
 
-            all_reviews.extend(platform_reviews)
+            # If this is a re-scrape to add dates, merge dates with existing reviews
+            if needs_rescrape:
+                existing_reviews = reviews_by_company.get(scrape_key, [])
+                # Check if new reviews have dates
+                new_reviews_with_dates = [r for r in platform_reviews if r.get("date")]
+                if not new_reviews_with_dates:
+                    print(f"      ⚠️  No dates found in newly scraped reviews (website may not provide dates)")
+                else:
+                    updated_count = merge_reviews_with_dates(existing_reviews, platform_reviews, company_id, platform)
+                    if updated_count > 0:
+                        print(f"      📅 Updated {updated_count} existing review(s) with date field")
+                    else:
+                        # Provide more detailed feedback
+                        existing_count = len([r for r in existing_reviews 
+                                            if r.get("company_id") == company_id and r.get("platform") == platform])
+                        print(f"      ⚠️  Could not match {len(new_reviews_with_dates)} new reviews with {existing_count} existing reviews")
+                        print(f"         (Text may have changed or reviews are different)")
+                # Don't add new reviews, just update existing ones in all_reviews
+                # The existing reviews are already in all_reviews, we just updated them
+            else:
+                # New scrape - add all reviews
+                all_reviews.extend(platform_reviews)
+            
             success_count += 1
 
             # Save after scraping
             save_data(REVIEWS_OUTPUT, all_reviews)
-            print(
-                f"      💾 Saved {len(platform_reviews)} total reviews from {pages_scraped} pages"
-            )
+            if needs_rescrape:
+                print(f"      💾 Updated existing reviews with dates")
+            else:
+                print(
+                    f"      💾 Saved {len(platform_reviews)} total reviews from {pages_scraped} pages"
+                )
+        elif needs_rescrape:
+            # Re-scrape found no reviews - still save to ensure file is updated
+            print(f"      ⚠️  No reviews found during re-scrape - existing reviews unchanged")
+            save_data(REVIEWS_OUTPUT, all_reviews)
 
         # Delay between companies to avoid rate limiting
         delay = random.uniform(*DELAY_BETWEEN_PLATFORMS)

@@ -202,6 +202,30 @@ USER_AGENTS = [
 ]
 
 
+def generate_ambitionbox_page_urls(base_url, max_pages=5):
+    """
+    Generate paginated AmbitionBox URLs
+    Example: Page 1: /reviews/company-reviews, Page 2: /reviews/company-reviews?page=2
+    """
+    urls = []
+    
+    # Remove existing page parameter if present
+    if '?page=' in base_url:
+        base_url = base_url.split('?page=')[0]
+    elif '&page=' in base_url:
+        base_url = base_url.split('&page=')[0]
+    
+    for page in range(1, max_pages + 1):
+        if page == 1:
+            urls.append(base_url)
+        else:
+            separator = "&" if "?" in base_url else "?"
+            url = f"{base_url}{separator}page={page}"
+            urls.append(url)
+    
+    return urls
+
+
 def init_browser():
     """Initialize Undetected Chrome browser to bypass Cloudflare"""
     try:
@@ -343,17 +367,6 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=5, try_alterna
 
         elif response.status_code == 404:
             print(f"      ⚠️  ScraperAPI 404: Target URL not found")
-            # Try to fix common URL issues before giving up
-            if retry == 0:
-                # Try fixing URL if it's missing /reviews
-                if "indeed.com/cmp/" in url and not url.endswith("/reviews") and "/reviews" not in url:
-                    fixed_url = url.rstrip("/") + "/reviews"
-                    print(f"      🔄 Trying fixed URL (added /reviews)...")
-                    time.sleep(2)
-                    # Recursively try with fixed URL (but don't increment retry to avoid double counting)
-                    fixed_result = scrape_with_scraperapi(fixed_url, render, 0, max_retries, try_alternative_params)
-                    if fixed_result and fixed_result != "NO_MORE_PAGES":
-                        return fixed_result
             # Return special value - caller will decide if it's an error (first page) or expected (subsequent pages)
             return "NO_MORE_PAGES"
 
@@ -388,8 +401,6 @@ def scrape_with_scraperapi(url, render=True, retry=0, max_retries=5, try_alterna
 
 
 def clean_review_text(text):
-    import re
-    
     if not text:
         return text
     
@@ -427,194 +438,140 @@ def clean_review_text(text):
 def parse_ambitionbox_html(html, max_reviews=10):
     """
     Parse AmbitionBox reviews from HTML
-    
-    AmbitionBox uses Next.js/React with Tailwind CSS, so reviews may be:
-    - In dynamically loaded sections
-    - In script tags with JSON data
-    - In divs with Tailwind utility classes
-    - Loaded via API calls (may not be in initial HTML)
+    Focuses on <div id="reviews-section"> which contains all actual reviews
     """
     reviews = []
     
     try:
         soup = BeautifulSoup(html, "html.parser")
         
-        # First, try to find reviews in JSON script tags (common in Next.js apps)
-        script_tags = soup.find_all('script', type='application/json')
-        for script in script_tags:
+        # Find the reviews-section div
+        reviews_section = soup.find('div', id='reviews-section')
+        if not reviews_section:
+            print("      ⚠️  reviews-section not found in HTML")
+            return reviews
+        
+        # Find all review elements using schema.org/Review pattern
+        review_elements = reviews_section.find_all('span', {'itemtype': 'https://schema.org/Review'})
+        
+        if not review_elements:
+            print("      ⚠️  No review elements found in reviews-section")
+            return reviews
+        
+        print(f"      Found {len(review_elements)} review elements in reviews-section")
+        
+        # Extract data from each review
+        for idx, review_elem in enumerate(review_elements[:max_reviews], 1):
             try:
-                import json
-                data = json.loads(script.string)
-                # Look for review data in JSON
-                if isinstance(data, dict):
-                    # Common patterns for review data
-                    for key in ['reviews', 'data', 'items', 'results']:
-                        if key in data and isinstance(data[key], list):
-                            for item in data[key][:max_reviews]:
-                                if isinstance(item, dict):
-                                    review_text = item.get('text') or item.get('content') or item.get('description') or item.get('review')
-                                    if review_text and len(str(review_text)) > 50:
-                                        reviews.append({
-                                            "topic": item.get('title') or item.get('heading') or None,
-                                            "text": str(review_text),
-                                            "rating": item.get('rating') or item.get('score') or None,
-                                        })
-            except:
-                pass
-        
-        # If we found reviews in JSON, return them
-        if reviews:
-            print(f"      ✓ Found {len(reviews)} reviews in JSON data")
-            return reviews[:max_reviews]
-        
-        # Otherwise, try to find review containers using various strategies
-        # Strategy 1: Look for divs with substantial text that might be reviews
-        all_divs = soup.find_all('div')
-        potential_reviews = []
-        
-        for div in all_divs:
-            # Skip script, style, and other non-content elements
-            if div.find('script') or div.find('style'):
-                continue
-            
-            text = div.get_text(separator=' ', strip=True)
-            # Look for substantial text blocks (100-5000 chars) that might be reviews
-            if 100 <= len(text) <= 5000:
-                text_lower = text.lower()
-                # Check if it contains review-like keywords
-                review_keywords = ['work', 'company', 'management', 'team', 'experience', 'employee', 
-                                  'job', 'career', 'colleague', 'boss', 'manager', 'salary', 'benefit']
-                # Check if it's NOT navigation/UI text
-                skip_keywords = ['login', 'sign up', 'filter', 'sort', 'search', 'navigation', 
-                               'menu', 'footer', 'header', 'cookie', 'privacy policy']
+                # Get review ID to find the corresponding div with visible content
+                review_id = review_elem.get('id', '')
                 
-                if (any(kw in text_lower for kw in review_keywords) and 
-                    not any(sk in text_lower for sk in skip_keywords) and
-                    len(text.split()) > 20):  # At least 20 words
-                    potential_reviews.append(div)
-        
-        # Strategy 2: Look for sections with class patterns that might contain reviews
-        # AmbitionBox uses Tailwind, so look for common card/container patterns
-        section_selectors = [
-            'section',
-            'div[class*="mb-"]',  # Margin bottom (common for spacing between reviews)
-            'div[class*="p-"]',   # Padding (common for card content)
-            'div[class*="border"]',  # Borders (common for cards)
-            'div[class*="rounded"]',  # Rounded corners (common for cards)
-        ]
-        
-        for selector in section_selectors:
-            elements = soup.select(selector)
-            for elem in elements:
-                text = elem.get_text(separator=' ', strip=True)
-                if 100 <= len(text) <= 5000:
-                    text_lower = text.lower()
-                    if (any(kw in text_lower for kw in ['work', 'company', 'management', 'team', 'experience']) and
-                        not any(sk in text_lower for sk in ['login', 'sign up', 'filter', 'navigation']) and
-                        len(text.split()) > 20):
-                        if elem not in potential_reviews:
-                            potential_reviews.append(elem)
-        
-        # Remove duplicates and limit
-        seen_texts = set()
-        unique_reviews = []
-        for elem in potential_reviews[:max_reviews * 3]:  # Get more candidates to filter
-            text = elem.get_text(separator=' ', strip=True)
-            text_hash = hash(text[:200])  # Use first 200 chars as hash
-            if text_hash not in seen_texts:
-                seen_texts.add(text_hash)
-                unique_reviews.append(elem)
-        
-        print(f"      Found {len(unique_reviews)} potential review containers")
-        
-        # Extract review data from each potential container
-        for idx, element in enumerate(unique_reviews[:max_reviews], 1):
-            try:
+                # Find the div with the same ID (contains visible review content)
+                review_div = None
+                if review_id:
+                    review_div = reviews_section.find('div', id=review_id)
+                
+                # Use review_div if found, otherwise use review_elem
+                container = review_div if review_div else review_elem
+                
+                # Extract topic from h2 with itemprop="name"
                 topic = None
-                text = ""
+                title_elem = container.find('h2', {'itemprop': 'name'})
+                if not title_elem:
+                    title_elem = review_elem.find('h2', {'itemprop': 'name'})
+                if title_elem:
+                    topic = title_elem.get_text(strip=True)
+                
+                # Extract rating from meta tag (in review_elem, not container)
                 rating = None
+                rating_meta = review_elem.find('meta', {'itemprop': 'ratingValue'})
+                if rating_meta:
+                    try:
+                        rating = float(rating_meta.get('content', ''))
+                    except:
+                        pass
                 
-                # Extract all text from the element
-                all_text = element.get_text(separator=' ', strip=True)
-                all_text = ' '.join(all_text.split())  # Normalize whitespace
+                # Extract date - prefer meta tag, fallback to span
+                date = None
+                date_meta = review_elem.find('meta', {'itemprop': 'datePublished'})
+                if date_meta:
+                    date_text = date_meta.get('content', '').strip()
+                    if date_text and re.match(r'\d{4}-\d{2}-\d{2}', date_text):
+                        try:
+                            from datetime import datetime
+                            dt = datetime.strptime(date_text, '%Y-%m-%d')
+                            date = dt.strftime('%d %b %Y')
+                        except:
+                            date = date_text
                 
-                # Skip if too short or too long
-                if len(all_text) < 100 or len(all_text) > 5000:
-                    continue
+                # Fallback: look for date span with "updated on" in container
+                if not date:
+                    all_spans = container.find_all('span')
+                    for span in all_spans:
+                        classes = span.get('class', [])
+                        class_str = ' '.join(classes) if isinstance(classes, list) else str(classes) if classes else ''
+                        if 'text-secondary-text' in class_str:
+                            span_text = span.get_text(strip=True)
+                            if 'updated on' in span_text.lower():
+                                date_match = re.search(r'updated\s+on\s+(.+)', span_text, re.IGNORECASE)
+                                if date_match:
+                                    date = re.sub(r'<!--\s*-->', '', date_match.group(1)).strip()
+                                    break
                 
-                # Try to extract topic from headings
-                headings = element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                for heading in headings[:1]:  # Just first heading
-                    heading_text = heading.get_text(strip=True)
-                    if heading_text and 5 <= len(heading_text) <= 100 and not heading_text.endswith('?'):
-                        topic = heading_text
-                        # Remove topic from main text if it appears at the start
-                        if all_text.startswith(topic):
-                            all_text = all_text[len(topic):].strip()
+                # Extract text: combine Likes and Dislikes from container
+                text_parts = []
+                
+                # Find Likes section - look for h3 with text "Likes"
+                likes_h3 = None
+                for h3 in container.find_all('h3'):
+                    h3_text = h3.get_text(strip=True)
+                    if h3_text == 'Likes':
+                        likes_h3 = h3
                         break
                 
-                # Extract rating from SVG stars or numeric patterns
-                # Look for rating in aria-labels or nearby text
-                rating_elements = element.find_all(['svg', 'span', 'div'], 
-                                                   attrs={'aria-label': True})
-                for rating_elem in rating_elements:
-                    aria_label = rating_elem.get('aria-label', '')
-                    if 'rating' in aria_label.lower() or 'star' in aria_label.lower():
-                        rating_match = re.search(r'(\d+\.?\d*)', aria_label)
-                        if rating_match:
-                            rating = float(rating_match.group(1))
-                            if rating > 5:
-                                rating = rating / 2
-                            break
+                if likes_h3:
+                    likes_p = likes_h3.find_next_sibling('p')
+                    if likes_p:
+                        likes_text = likes_p.get_text(strip=True)
+                        if likes_text and len(likes_text) > 3:
+                            text_parts.append(f"Likes: {likes_text}")
                 
-                # If no rating found, look for numeric patterns near "star" or "rating"
-                if not rating:
-                    rating_text = element.get_text()
-                    rating_match = re.search(r'(\d+\.?\d*)\s*(?:star|rating|/5|out of 5)', rating_text, re.IGNORECASE)
-                    if rating_match:
-                        rating = float(rating_match.group(1))
-                        if rating > 5:
-                            rating = rating / 2
+                # Find Dislikes section - look for h3 with text "Dislikes"
+                dislikes_h3 = None
+                for h3 in container.find_all('h3'):
+                    h3_text = h3.get_text(strip=True)
+                    if h3_text == 'Dislikes':
+                        dislikes_h3 = h3
+                        break
                 
-                # Clean up the text
-                text = all_text
+                if dislikes_h3:
+                    dislikes_p = dislikes_h3.find_next_sibling('p')
+                    if dislikes_p:
+                        dislikes_text = dislikes_p.get_text(strip=True)
+                        if dislikes_text and len(dislikes_text) > 3:
+                            text_parts.append(f"Dislikes: {dislikes_text}")
                 
-                # Remove common question patterns at the start
-                question_patterns = [
-                    r'^what is the best part',
-                    r'^what is the most stressful',
-                    r'^what is the work environment',
-                    r'^how (is|are|do|does)',
-                    r'^can you', r'^would you', r'^tell us',
-                ]
-                for pattern in question_patterns:
-                    text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+                # Combine text
+                text = ' '.join(text_parts) if text_parts else None
                 
-                text = clean_review_text(text)
+                # Clean up text
+                if text:
+                    text = clean_review_text(text)
                 
-                # Final validation: ensure it looks like a review
-                if text and len(text) > 50:
-                    text_lower = text.lower()
-                    # Skip if it's clearly not a review
-                    skip_patterns = [
-                        'apparel group', 'private limited', 'company name',
-                        'jobseekers also viewed', 'similar companies',
-                        'write a review', 'login to continue',
-                    ]
-                    if any(pattern in text_lower for pattern in skip_patterns):
-                        continue
-                    
+                # Only add if we have meaningful text
+                if text and len(text) > 20:
                     reviews.append({
                         "topic": topic,
                         "text": text,
                         "rating": rating,
+                        "date": date,
                     })
             
             except Exception as e:
                 print(f"      ⚠️  Error parsing review {idx}: {str(e)[:40]}")
                 continue
         
-        print(f"      ✓ Parsed {len(reviews)} reviews from HTML")
+        print(f"      ✓ Parsed {len(reviews)} reviews from reviews-section")
     
     except Exception as e:
         print(f"      ❌ HTML parsing error: {str(e)[:60]}")
@@ -765,19 +722,70 @@ def load_existing_data(output_path):
                 # Get set of already scraped company-platform combinations
                 # Use company_id if available, otherwise fallback to company_name
                 scraped_keys = set()
+                # Map company_id -> list of reviews (to check for missing dates)
+                reviews_by_company = {}
                 for item in data:
                     company_id = item.get("company_id")
                     company_name = item.get("company_name", "Unknown")
                     platform = item.get("platform", "unknown")
                     if company_id:
-                        scraped_keys.add(f"{company_id}_{platform}")
+                        key = f"{company_id}_{platform}"
+                        scraped_keys.add(key)
+                        if key not in reviews_by_company:
+                            reviews_by_company[key] = []
+                        reviews_by_company[key].append(item)
                     else:
-                        scraped_keys.add(f"{company_name}_{platform}")
-                return data, scraped_keys
+                        key = f"{company_name}_{platform}"
+                        scraped_keys.add(key)
+                        if key not in reviews_by_company:
+                            reviews_by_company[key] = []
+                        reviews_by_company[key].append(item)
+                return data, scraped_keys, reviews_by_company
         except Exception as e:
             print(f"⚠️  Could not load existing data: {e}")
-            return [], set()
-    return [], set()
+            return [], set(), {}
+    return [], set(), {}
+
+
+def has_missing_dates(reviews):
+    """Check if any reviews in the list are missing the date field"""
+    if not reviews:
+        return True
+    for review in reviews:
+        if "date" not in review or review.get("date") is None:
+            return True
+    return False
+
+
+def merge_reviews_with_dates(existing_reviews, new_reviews, company_id, platform):
+    """
+    Merge new reviews with existing reviews, matching by text and updating dates.
+    Returns updated list of reviews with dates added to existing ones.
+    """
+    # Create a map of existing reviews by text signature (first 100 chars)
+    existing_map = {}
+    for review in existing_reviews:
+        if review.get("company_id") == company_id and review.get("platform") == platform:
+            text = review.get("text", "")
+            if text:
+                # Use first 100 chars as signature for matching
+                signature = text[:100].lower().strip()
+                existing_map[signature] = review
+    
+    # Update existing reviews with dates from new reviews
+    updated_count = 0
+    for new_review in new_reviews:
+        text = new_review.get("text", "")
+        if text:
+            signature = text[:100].lower().strip()
+            if signature in existing_map:
+                existing_review = existing_map[signature]
+                # Update date if it's missing in existing review
+                if ("date" not in existing_review or existing_review.get("date") is None) and new_review.get("date"):
+                    existing_review["date"] = new_review.get("date")
+                    updated_count += 1
+    
+    return updated_count
 
 
 def save_data(output_path, all_data):
@@ -830,11 +838,18 @@ def main():
         print("⚠️  ScraperAPI not configured - Indeed scraping will be limited")
 
     # Load existing data
-    all_reviews, scraped_keys = load_existing_data(REVIEWS_OUTPUT)
+    all_reviews, scraped_keys, reviews_by_company = load_existing_data(REVIEWS_OUTPUT)
     if scraped_keys:
         print(
             f"✓ Found {len(scraped_keys)} already scraped company-platform combinations"
         )
+        # Check how many have missing dates
+        missing_dates_count = 0
+        for key in scraped_keys:
+            if key in reviews_by_company and has_missing_dates(reviews_by_company[key]):
+                missing_dates_count += 1
+        if missing_dates_count > 0:
+            print(f"   📅 {missing_dates_count} company(ies) have reviews missing date field - will re-scrape to add dates")
 
     print("✓ Using undetected-chromedriver (bypasses Cloudflare)")
     print(f"✓ Max reviews per company: {MAX_REVIEWS_PER_COMPANY}")
@@ -880,15 +895,22 @@ def main():
 
         # Check if already scraped
         scrape_key = f"{company_id}_{platform}"
+        needs_rescrape = False
         if scrape_key in scraped_keys:
-            print(f"   AmbitionBox: Already scraped (skipped)")
-            skipped_count += 1
-            continue
+            # Check if reviews are missing dates
+            existing_reviews = reviews_by_company.get(scrape_key, [])
+            if has_missing_dates(existing_reviews):
+                print(f"   AmbitionBox: Already scraped but missing dates - re-scraping to add dates...")
+                needs_rescrape = True
+            else:
+                print(f"   AmbitionBox: Already scraped with dates (skipped)")
+                skipped_count += 1
+                continue
+        else:
+            print(f"   AmbitionBox: Scraping...")
 
-        print(f"   AmbitionBox: Scraping...")
-
-        # No pagination for AmbitionBox
-        page_urls = [base_url]
+        # Generate paginated URLs for AmbitionBox
+        page_urls = generate_ambitionbox_page_urls(base_url, MAX_PAGES_PER_COMPANY)
 
         # Scrape multiple pages
         platform_reviews = []
@@ -956,38 +978,59 @@ def main():
                 print(f"      ⏳ Waiting {delay:.1f}s before next page...")
                 time.sleep(delay)
 
-            # Save all reviews from this platform
-            if platform_reviews:
-                # Add company context to each review with required fields
-                for review in platform_reviews:
-                    # Ensure all required fields are present
-                    review["company_id"] = company_id
-                    review["company_name"] = company_name
-                    review["location"] = location
-                    review["url"] = base_url  # Use base URL
-                    review["platform"] = platform
-                    # Ensure topic, text, rating exist (may be None)
-                    if "topic" not in review:
-                        review["topic"] = None
-                    if "text" not in review:
-                        review["text"] = review.get("review_text", "")
-                    if "rating" not in review:
-                        review["rating"] = None
-                    # Remove any extra fields not in the required list
-                    allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating"]
-                    review_copy = {k: v for k, v in review.items() if k in allowed_fields}
-                    review.clear()
-                    review.update(review_copy)
+        # Save all reviews from this platform
+        if platform_reviews:
+            # Add company context to each review with required fields
+            for review in platform_reviews:
+                # Ensure all required fields are present
+                review["company_id"] = company_id
+                review["company_name"] = company_name
+                review["location"] = location
+                review["url"] = base_url  # Use base URL
+                review["platform"] = platform
+                # Ensure topic, text, rating, date exist (may be None)
+                if "topic" not in review:
+                    review["topic"] = None
+                if "text" not in review:
+                    review["text"] = review.get("review_text", "")
+                if "rating" not in review:
+                    review["rating"] = None
+                if "date" not in review:
+                    review["date"] = None
+                # Remove any extra fields not in the required list
+                allowed_fields = ["company_id", "company_name", "location", "url", "platform", "topic", "text", "rating", "date"]
+                review_copy = {k: v for k, v in review.items() if k in allowed_fields}
+                review.clear()
+                review.update(review_copy)
 
+            # If this is a re-scrape to add dates, merge dates with existing reviews
+            if needs_rescrape:
+                existing_reviews = reviews_by_company.get(scrape_key, [])
+                updated_count = merge_reviews_with_dates(existing_reviews, platform_reviews, company_id, platform)
+                if updated_count > 0:
+                    print(f"      📅 Updated {updated_count} existing review(s) with date field")
+                else:
+                    print(f"      ⚠️  Could not match new reviews with existing ones to update dates")
+                # Don't add new reviews, just update existing ones in all_reviews
+                # The existing reviews are already in all_reviews, we just updated them
+            else:
+                # New scrape - add all reviews
                 all_reviews.extend(platform_reviews)
-                success_count += 1
-                company_had_success = True
+            
+            success_count += 1
 
-                # Save after each platform
-                save_data(REVIEWS_OUTPUT, all_reviews)
+            # Save after scraping
+            save_data(REVIEWS_OUTPUT, all_reviews)
+            if needs_rescrape:
+                print(f"      💾 Updated existing reviews with dates")
+            else:
                 print(
                     f"      💾 Saved {len(platform_reviews)} total reviews from {pages_scraped} pages"
                 )
+        elif needs_rescrape:
+            # Re-scrape found no reviews - still save to ensure file is updated
+            print(f"      ⚠️  No reviews found during re-scrape - existing reviews unchanged")
+            save_data(REVIEWS_OUTPUT, all_reviews)
 
         # Delay between companies to avoid rate limiting
         delay = random.uniform(*DELAY_BETWEEN_PLATFORMS)
